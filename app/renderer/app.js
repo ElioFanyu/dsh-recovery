@@ -367,17 +367,52 @@ const ACTIONS = {
     await run("修复插件状态", "pluginRepair", false);
   },
   "plugin-repair-preview": () => run("预览修复内容", "pluginRepair", true),
+  "plugin-install-preview": async () => {
+    const input = document.getElementById("plugin-install-input");
+    const spec = typeof input?.value === "string" ? input.value.trim() : "";
+    if (spec === "") {
+      toast("请先填入包名或 GitHub 地址", "error");
+      return;
+    }
+    await run("预览安装", "pluginInstall", spec, true);
+  },
   "plugin-install": async () => {
     const input = document.getElementById("plugin-install-input");
     const spec = typeof input?.value === "string" ? input.value.trim() : "";
     if (spec === "") {
-      toast("请先填入要安装的包名", "error");
+      toast("请先填入要安装的包名或 GitHub 地址", "error");
       return;
     }
-    if (!confirm(`安装插件：${spec}\n\n会用 pnpm 安装到当前 Profile，装完校验入口文件与插件层条目。\n执行前会自动创建检查点。确定继续吗？`)) return;
+    // A repository is installed as the package it publishes, so say that up
+    // front instead of after pnpm has run.
+    const isRepo =
+      /^(?:git@|(?:git\+)?(?:https?|ssh|git):\/\/)?(?:www\.)?github\.com[/:]/iu.test(spec) || /^[^\s@/]+\/[^\s@/]+#/u.test(spec);
+    if (
+      !confirm(
+        `安装插件：${spec}\n\n` +
+          (isRepo
+            ? "· 会先读取该仓库的 package.json，确认它发布的 npm 包名\n· 然后用 pnpm 从 npm 安装那个包（不是仓库源码）\n"
+            : "· 会用 pnpm 安装到当前 Profile\n") +
+          "· 装完校验入口文件与插件层条目\n· 执行前会自动创建检查点\n\n确定继续吗？",
+      )
+    )
+      return;
     const response = await run(`安装 ${spec}`, "pluginInstall", spec, false);
     if (response?.ok === true && input !== null) input.value = "";
   },
+  "plugin-install-market": async () => {
+    if (
+      !confirm(
+        "安装插件市场：\\n\\n" +
+          "· 用 pnpm 把 dshmarket 装进当前 Profile，并加入插件层\\n" +
+          "· 市场是应用内安装/浏览插件的入口，装好后重启 DSH 才会出现\\n" +
+          "· 执行前会自动创建检查点，可随时回滚\\n\\n确定继续吗？",
+      )
+    )
+      return;
+    await run("安装插件市场", "pluginInstallMarket", false);
+  },
+  "plugin-install-market-preview": () => run("预览安装插件市场", "pluginInstallMarket", true),
   "plugin-update": async (arg) => {
     const plugin = state.pluginUpdater?.rows?.find((entry) => entry.name === arg);
     const from = plugin?.version;
@@ -964,6 +999,30 @@ function renderUpdater() {
     running ? card({ danger: true, title: "请先退出 DSH", desc: `应用正在运行（PID ${runningPidText(state.running)}）。请用下方「停止」或直接退出 DSH（含托盘图标），然后刷新本页。运行中写入会被应用退出流程覆盖。` }) : undefined,
   ];
 
+  // --- what may make this update slow --------------------------------------
+  // An update can legitimately take a while (lockfile policy check, no hard
+  // links, a stale lock). Saying so up front is the difference between "slow"
+  // and "it froze"; the run itself is bounded by a timeout either way.
+  const risks = info.risks ?? [];
+  if (risks.length > 0) {
+    nodes.push(
+      card({
+        title: "更新前需要知道的情况",
+        desc: "这些不是错误，但会让本次更新变慢或容易失败。更新本身有超时上限，不会无限卡住。",
+        tags: [chip(`${risks.length} 项`, risks.some((risk) => risk.level === "warn") ? "warn" : undefined)],
+        body: list(
+          risks.map((risk) =>
+            row({
+              name: risk.text,
+              muted: risk.level !== "warn",
+              side: [chip(risk.level === "warn" ? "建议先处理" : "说明", risk.level === "warn" ? "warn" : undefined)],
+            }),
+          ),
+        ),
+      }),
+    );
+  }
+
   // --- what went wrong last time ------------------------------------------
   if (stuck.length > 0) {
     nodes.push(
@@ -1035,69 +1094,114 @@ function renderUpdater() {
     );
   }
 
-  // --- the one case with no in-app path -----------------------------------
-  const market = rows.find((entry) => entry.name === "dshmarket" || entry.name === "dsh-market");
-  if (market !== undefined) {
+  // --- the market itself: install it, or update it -------------------------
+  // Two different situations, one card. A profile without the market has no
+  // in-app entry to install it (the market IS the install entry), so the
+  // console is the only place that can put it there; a profile with the market
+  // cannot update it from inside either. Which button shows is decided by
+  // `market.installed`, never by guessing from the row list.
+  const market = info.market ?? { name: "dshmarket", installed: false };
+  nodes.push(
+    card({
+      icon: "🛒",
+      title: market.installed ? "更新插件市场本身" : "安装插件市场",
+      desc: market.installed
+        ? "桌面端的市场不能在自己发起的请求里更新自己（会先把市场从运行中的组合里摘掉，补装那一步就执行不到了），应用内也没有更新入口。这一项只能在这里做。"
+        : "这个 Profile 里没有插件市场（dshmarket）。市场本身就是应用内安装插件的入口，缺了它应用里就没有任何安装页面 —— 所以只能在这里装上。",
+      body: metrics([
+        market.installed
+          ? ["当前版本", market.version ?? "—"]
+          : ["状态", "尚未安装"],
+        ["声明", market.declared ?? "—"],
+        ["插件层", market.inBundles ? "已启用" : market.installed ? "未在插件层" : "—"],
+      ]),
+      actions: market.installed
+        ? [
+            button("升级到最新", "plugin-update", market.name, { className: "btn--primary", disabled: running }),
+            button("检查安装", "plugin-check", market.name),
+          ]
+        : [
+            button("安装插件市场", "plugin-install-market", undefined, { className: "btn--primary", disabled: running }),
+            button("预览安装", "plugin-install-market-preview", undefined, { className: "btn--ghost", disabled: running }),
+          ],
+    }),
+  );
+
+  // --- installed plugins, split by where they came from --------------------
+  // 联网 and 本地 are not the same kind of thing. A registry package is a
+  // downloaded copy, so "升级" resolves a newer one. A local plugin is a `link:`
+  // pointing at a working copy on this machine: pnpm has no upgrade for it, and
+  // `pnpm add name@latest` would replace the link with a registry download and
+  // silently detach the folder the user actually edits. Offering the button
+  // there would be a trap, so local rows get 检查 only.
+  const registryPlugins = installed.filter((entry) => entry.origin !== "local").sort((left, right) => left.name.localeCompare(right.name, "en"));
+  const localPlugins = installed.filter((entry) => entry.origin === "local").sort((left, right) => left.name.localeCompare(right.name, "en"));
+
+  const pluginRow = (entry, updatable) =>
+    row({
+      name: entry.name,
+      mono: true,
+      muted: entry.problems.length > 0,
+      sub: joinSub(
+        entry.version,
+        entry.declared === entry.version ? undefined : `声明 ${entry.declared}`,
+        entry.bundle ? undefined : "非插件包",
+        updatable ? undefined : "本地工作副本",
+      ),
+      side: [
+        chip(entry.inBundles ? "插件层" : "未启用", entry.inBundles ? "ok" : undefined),
+        updatable ? button("升级", "plugin-update", entry.name, { className: "btn--primary", disabled: running }) : undefined,
+        button("检查", "plugin-check", entry.name, { className: "btn--ghost" }),
+        updatable ? undefined : button("打开文件夹", "open-plugin", entry.name, { className: "btn--ghost" }),
+      ],
+    });
+
+  if (installed.length === 0) {
+    nodes.push(card({ title: "已安装的插件", body: empty("这个 Profile 还没有安装任何插件。") }));
+  } else {
     nodes.push(
       card({
-        icon: "🔄",
-        title: "更新插件市场本身",
-        desc:
-          "桌面端的市场不能在自己发起的请求里更新自己（会先把市场从运行中的组合里摘掉，补装那一步就执行不到了），应用内也没有更新入口。这一项只能在这里做。",
-        body: metrics([
-          ["当前版本", market.version ?? "—"],
-          ["声明", market.declared ?? "—"],
-          ["插件层", market.inBundles ? "已启用" : "未在插件层"],
-        ]),
-        actions: [
-          button("升级到最新", "plugin-update", market.name, { className: "btn--primary", disabled: running }),
-          button("检查安装", "plugin-check", market.name),
-        ],
+        icon: "🌐",
+        title: `联网插件（${registryPlugins.length}）`,
+        desc: "从 npm 安装的包。升级会用 pnpm 重新解析最新版本（包括固定版本号的那些），装完再校验入口文件与插件层条目。",
+        body:
+          registryPlugins.length === 0
+            ? empty("没有联网安装的插件。")
+            : list(registryPlugins.map((entry) => pluginRow(entry, true))),
+      }),
+    );
+    nodes.push(
+      card({
+        icon: "📁",
+        title: `本地插件（${localPlugins.length}）`,
+        desc: "用 link: / 符号链接指向本机工作副本的插件，代码在它自己的文件夹里。这里不提供升级 —— pnpm 升级会把这个链接换成 registry 下载的副本，你的工作副本就被断开了。改代码请直接在它的文件夹里改。",
+        body:
+          localPlugins.length === 0
+            ? empty("没有本地插件。")
+            : list(localPlugins.map((entry) => pluginRow(entry, false))),
       }),
     );
   }
 
-  // --- every updatable plugin ---------------------------------------------
-  nodes.push(
-    card({
-      title: "已安装的插件",
-      desc: "升级会用 pnpm 重新解析该包（包括固定版本号的那些），装完再校验入口文件与插件层条目。",
-      body:
-        installed.length === 0
-          ? empty("这个 Profile 还没有安装任何插件。")
-          : list(
-              installed.map((entry) =>
-                row({
-                  name: entry.name,
-                  mono: true,
-                  muted: entry.problems.length > 0,
-                  sub: joinSub(entry.version, entry.declared === entry.version ? undefined : `声明 ${entry.declared}`, entry.bundle ? undefined : "非插件包"),
-                  side: [
-                    chip(entry.inBundles ? "插件层" : "未启用", entry.inBundles ? "ok" : undefined),
-                    button("升级", "plugin-update", entry.name, { className: "btn--primary", disabled: running }),
-                    button("检查", "plugin-check", entry.name, { className: "btn--ghost" }),
-                  ],
-                }),
-              ),
-            ),
-    }),
-  );
-
-  // --- install by name ----------------------------------------------------
+  // --- install by name or by repository -----------------------------------
   nodes.push(
     card({
       title: "安装一个插件",
-      desc: "填入 npm 包名或完整 spec（例如 dsh-connect-workbuddy 或 name@1.2.3）。装完若该包声明了 dsh.bundle，会自动加入插件层。",
+      desc:
+        "填 npm 包名（dsh-connect-workbuddy、name@1.2.3、@scope/name），或直接粘贴 GitHub 地址" +
+        "（https://github.com/owner/repo）。GitHub 地址会先读出该仓库发布的包名，再从 npm 安装它 —— " +
+        "装的是仓库发布的正式版本，而不是仓库源码。装完若该包声明了 dsh.bundle，会自动加入插件层。",
       body: el("div", { class: "field-row" }, [
         el("input", {
           class: "input",
           type: "text",
-          placeholder: "包名或 name@version",
+          placeholder: "包名 / name@version / https://github.com/owner/repo",
           id: "plugin-install-input",
           spellcheck: "false",
           disabled: running,
         }),
         button("安装", "plugin-install", undefined, { className: "btn--primary", disabled: running }),
+        button("预览", "plugin-install-preview", undefined, { className: "btn--ghost", disabled: running }),
       ]),
     }),
   );
@@ -1839,6 +1943,20 @@ function footerActions(running) {
   };
 }
 
+/**
+ * The footer's buttons as a list with the holes already removed.
+ *
+ * `footerActions()` deliberately leaves a hole where a button does not apply,
+ * so anything iterating the result must drop the holes *before* reading a
+ * field. Doing that inline used to throw `Cannot read properties of undefined
+ * (reading 'label')` whenever the application was stopped — and because every
+ * action re-renders, that one throw blanked the footer AND turned each
+ * successful action into an error toast.
+ */
+function footerButtons(running) {
+  return Object.values(footerActions(running)).filter(Boolean);
+}
+
 function renderFooter() {
   const host = document.getElementById("status");
   const actions = document.getElementById("footer-actions");
@@ -1863,10 +1981,9 @@ function renderFooter() {
 
   // `append()` is the local helper (skips undefined/null/false); the native
   // ParentNode.append() would stringify a missing entry instead.
-  const spec = footerActions(running);
   append(
     clear(actions),
-    Object.values(spec).map((entry) => button(entry.label, entry.action, entry.arg, { className: entry.className })),
+    footerButtons(running).map((entry) => button(entry.label, entry.action, entry.arg, { className: entry.className })),
   );
 }
 

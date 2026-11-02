@@ -13,6 +13,7 @@ const { app, BrowserWindow, ipcMain, shell } = require("electron");
 
 const { RecoveryController } = require("./backend/ipc");
 const { PROJECT_ROOT } = require("./backend/paths");
+const paths = require("./backend/paths");
 const { runVerify } = require("./backend/verify");
 
 // Keep the console's Chromium profile inside the tool instead of polluting
@@ -59,6 +60,7 @@ const CHANNELS = [
   "recovery:plugin-updater",
   "recovery:plugin-repair",
   "recovery:plugin-install",
+  "recovery:plugin-install-market",
   "recovery:plugin-update",
   "recovery:plugin-remove",
   "recovery:plugin-check",
@@ -166,6 +168,7 @@ async function runUiCheck({ shot }) {
     "pluginUpdater",
     "pluginRepair",
     "pluginInstall",
+    "pluginInstallMarket",
     "pluginUpdate",
     "pluginCheck",
     "awesomeSetDir",
@@ -181,7 +184,7 @@ async function runUiCheck({ shot }) {
   // The two one-click actions must be reachable from their panels, not just
   // present in the bridge.
   const panelProbe =
-    "((id) => { const node = document.querySelector(`.panel[data-panel=\"${id}\"]`); return node === null ? null : { text: node.innerText, actions: [...node.querySelectorAll('button[data-action]')].map((b) => ({ action: b.dataset.action, label: b.textContent, disabled: b.disabled })) }; })";
+    "((id) => { const node = document.querySelector(`.panel[data-panel=\"${id}\"]`); return node === null ? null : { text: node.innerText, actions: [...node.querySelectorAll('button[data-action]')].map((b) => ({ action: b.dataset.action, arg: b.dataset.arg, label: b.textContent, disabled: b.disabled })) }; })";
   const pluginsPanel = await win.webContents.executeJavaScript(`${panelProbe}("plugins")`);
   if (pluginsPanel === null) issues.push("找不到「插件管理」面板");
   else {
@@ -211,9 +214,14 @@ async function runUiCheck({ shot }) {
   if (/undefined/u.test(footerText)) issues.push(`页脚出现了 undefined 文字：${footerText.trim()}`);
   // The reported bug only appears while the application is stopped, which the
   // live window cannot always reproduce (it may well be running). Ask the
-  // renderer for both states of the pure builder instead.
+  // renderer for both states of the real builder instead.
+  //
+  // This must call `footerButtons()`, the function the footer actually renders
+  // with. An earlier version iterated `footerActions()` and filtered the holes
+  // out itself, which hid the very crash it was meant to catch: reading
+  // `.label` off the `stop: undefined` hole threw only in the real render path.
   const footerStates = await win.webContents.executeJavaScript(
-    "(() => { const out = {}; for (const running of [false, true]) { const spec = footerActions(running); out[String(running)] = { keys: Object.keys(spec), holey: Object.values(spec).filter((v) => v === undefined).length, labels: Object.values(spec).filter(Boolean).map((v) => v.label) }; } return out; })()",
+    "(() => { const out = {}; for (const running of [false, true]) { try { const list = footerButtons(running); out[String(running)] = { labels: list.map((v) => v.label), holey: list.filter((v) => v === undefined).length }; } catch (error) { out[String(running)] = { error: String(error && error.message) }; } } return out; })()",
   );
   for (const [key, expected] of [
     ["false", ["刷新状态", "启动", "退出"]],
@@ -224,9 +232,13 @@ async function runUiCheck({ shot }) {
       issues.push(`页脚状态 ${key} 无法求值`);
       continue;
     }
-    // A hole in the object is fine (the local append() drops it); a label list
-    // that differs means a button went missing or gained an "undefined" label.
-    if (got.holey > 1) issues.push(`页脚状态 ${key} 有 ${got.holey} 个空按钮`);
+    if (typeof got.error === "string") {
+      issues.push(`页脚状态 ${key} 渲染抛异常：${got.error}`);
+      continue;
+    }
+    // A label list that differs means a button went missing or gained an
+    // "undefined" label.
+    if (got.holey > 0) issues.push(`页脚状态 ${key} 有 ${got.holey} 个空按钮`);
     if (JSON.stringify(got.labels) !== JSON.stringify(expected)) {
       issues.push(`页脚状态 ${key} 的按钮为 ${got.labels.join("/")}，期望 ${expected.join("/")}`);
     }
@@ -249,6 +261,91 @@ async function runUiCheck({ shot }) {
     }
     if (!updaterPanel.text.includes("插件市场") && !updaterPanel.text.includes("dshmarket")) {
       issues.push("插件更新面板没有提到插件市场自身");
+    }
+    // 安装市场 and 升级市场 are mutually exclusive, and which one is right
+    // depends on the machine: a profile without the market must offer the
+    // install (nothing in the app can do it), one with it must offer the
+    // update. Exactly one of the two must be there, and it must agree with the
+    // version text beside it.
+    const installMarket = updaterPanel.actions.find((button) => button.action === "plugin-install-market");
+    const updateMarket = updaterPanel.actions.find(
+      (button) => button.action === "plugin-update" && button.arg === "dshmarket",
+    );
+    const marketInstalled = updaterPanel.text.includes("更新插件市场本身");
+    // The status metric must agree with the buttons: an install card that also
+    // printed a version, or an update card with no version, would contradict
+    // itself on screen.
+    if (marketInstalled === updaterPanel.text.includes("尚未安装")) {
+      issues.push(`插件更新：市场卡片的状态与按钮不一致（installed=${marketInstalled}）`);
+    }
+    if (marketInstalled) {
+      if (installMarket !== undefined) issues.push("插件市场已安装，却仍显示「安装插件市场」按钮");
+      if (updateMarket === undefined) issues.push("插件市场已安装，但没有「升级到最新」按钮");
+    } else {
+      if (installMarket === undefined) issues.push("插件市场未安装，却没有「安装插件市场」按钮");
+      if (updateMarket !== undefined) issues.push("插件市场未安装，却显示了「升级到最新」按钮");
+    }
+
+    // Clicking a card action must not break the window. The renderer re-renders
+    // after every action, and a throw inside that render is caught by the same
+    // handler as a failed action — so a rendering bug surfaced as an error toast
+    // on a *successful* click, with the footer blanked. 检查安装 is the safe
+    // button to click here: it writes nothing, so this runs on any machine.
+    const clickable = updaterPanel.actions.find(
+      (button) => button.action === "plugin-check" && button.arg === "dshmarket",
+    );
+    if (clickable === undefined) {
+      issues.push("插件更新面板没有可点击的市场「检查安装」按钮");
+    } else if (clickable.disabled !== true) {
+      await win.webContents.executeJavaScript(
+        `document.querySelector('.panel[data-panel="updater"] button[data-action="plugin-check"][data-arg="dshmarket"]').click()`,
+      );
+      await sleep(1200);
+      const afterClick = await win.webContents.executeJavaScript(
+        `({ footer: [...document.querySelectorAll('#footer-actions button')].length, renderError: window.__renderError ?? null, toasts: [...document.querySelectorAll('#toasts .toast')].map((node) => node.textContent) })`,
+      );
+      if (afterClick.renderError !== null) issues.push(`点击市场「检查安装」后渲染异常：${afterClick.renderError}`);
+      if (afterClick.footer === 0) issues.push("点击市场「检查安装」后页脚按钮消失");
+      // A rendering crash arrives as a toast too; the action itself only
+      // reports success or a real refusal.
+      const crash = (afterClick.toasts ?? []).find((text) => /reading 'label'|Cannot read propert/u.test(text));
+      if (crash !== undefined) issues.push(`点击市场「检查安装」弹出了渲染异常：${crash}`);
+    }
+
+    // 本地 and 联网 plugins are listed separately, and a local row must not
+    // offer 升级: pnpm would replace the link with a registry download.
+    const groups = await win.webContents.executeJavaScript(
+      `(() => {
+        const panel = document.querySelector('.panel[data-panel="updater"]');
+        if (panel === null) return null;
+        const cards = [...panel.querySelectorAll('section.card')];
+        const named = (prefix) => cards.find((card) => (card.querySelector('.card__title')?.textContent ?? '').startsWith(prefix));
+        const local = named('本地插件');
+        const registry = named('联网插件');
+        const updatable = (card) => card === undefined ? null : [...card.querySelectorAll('button[data-action="plugin-update"]')].length;
+        const rowNames = (card) => card === undefined ? null : [...card.querySelectorAll('.row__name')].map((node) => node.textContent);
+        return {
+          hasLocal: local !== undefined,
+          hasRegistry: registry !== undefined,
+          localUpdates: updatable(local),
+          registryUpdates: updatable(registry),
+          localRows: rowNames(local),
+          registryRows: rowNames(registry),
+        };
+      })()`,
+    );
+    if (groups === null) {
+      issues.push("无法读取插件更新面板的插件分组");
+    } else {
+      if (groups.hasLocal !== true) issues.push("插件更新面板没有「本地插件」分组");
+      if (groups.hasRegistry !== true) issues.push("插件更新面板没有「联网插件」分组");
+      if (groups.localUpdates !== 0) {
+        issues.push(`「本地插件」分组出现了 ${groups.localUpdates} 个升级按钮（会把 link 换成 registry 副本）`);
+      }
+      // A machine with no local plugins renders an empty group, which is fine;
+      // what must never happen is a plugin appearing in both lists.
+      const both = (groups.localRows ?? []).filter((name) => (groups.registryRows ?? []).includes(name));
+      if (both.length > 0) issues.push(`插件同时出现在本地与联网分组：${both.join("、")}`);
     }
   }
 
@@ -448,11 +545,25 @@ const ready = (async () => {
   const profileName = argvValue("--profile=");
   const dshHome = argvValue("--home=");
   if (targetId !== undefined || profileName !== undefined || dshHome !== undefined) {
-    controller.persist({
-      ...(targetId === undefined ? {} : { targetId }),
-      ...(profileName === undefined ? {} : { profileName }),
-      ...(dshHome === undefined ? {} : { dshHome }),
-    });
+    // `--ui-check` points the console at throwaway homes and profiles. Those
+    // arguments must stay in memory for that run: persisting them left the
+    // console aimed at a fixture directory that the run itself deleted, so the
+    // next normal launch showed every panel empty. The headless self tests do
+    // the same and keep the real config byte-identical.
+    if (uiCheck) {
+      controller.config = {
+        ...controller.config,
+        ...(targetId === undefined ? {} : { targetId }),
+        ...(profileName === undefined ? {} : { profileName }),
+        ...(dshHome === undefined ? {} : { dshHome }),
+      };
+    } else {
+      controller.persist({
+        ...(targetId === undefined ? {} : { targetId }),
+        ...(profileName === undefined ? {} : { profileName }),
+        ...(dshHome === undefined ? {} : { dshHome }),
+      });
+    }
   }
   await controller.refresh({ sizes: false });
   if (selfCheck) {
@@ -506,8 +617,27 @@ const ready = (async () => {
 /** Drives the already-rendered window and reports; only `--ui-check` calls this. */
 async function startUiCheck() {
   const shot = argvValue("--ui-shot=") ?? path.join(PROJECT_ROOT, ".runtime", "ui-restart-tab.png");
+  // A UI check must not rewrite the user's saved selection. It used to: a run
+  // with `--home=…\fixture-home --profile=demo` persisted both, and because
+  // the run also deletes that fixture, the next normal launch opened every
+  // panel empty against a directory that no longer existed. Comparing the file
+  // byte for byte is what makes that failure visible instead of silent.
+  const configFile = paths.configPath();
+  let configBefore;
+  try {
+    configBefore = fs.readFileSync(configFile);
+  } catch {
+    configBefore = undefined;
+  }
   try {
     const outcome = await runUiCheck({ shot });
+    try {
+      const configAfter = fs.readFileSync(configFile);
+      const unchanged = configBefore !== undefined && configBefore.equals(configAfter);
+      if (!unchanged) outcome.issues.push(`ui-check 改写了控制台配置: ${configFile}`);
+    } catch {
+      outcome.issues.push(`ui-check 删除了控制台配置: ${configFile}`);
+    }
     process.stdout.write(`${JSON.stringify(outcome, undefined, 2)}\n`);
     process.stdout.write(outcome.issues.length === 0 ? "ui-check: ok\n" : `ui-check: ${outcome.issues.length} problem(s)\n`);
     app.exit(outcome.issues.length === 0 ? 0 : 1);

@@ -287,7 +287,9 @@ class RecoveryController {
         );
       }
       const checkpoint = await this.autoCheckpoint(`${label} 之前`);
-      const outcome = mutator(dir, installDir);
+      // The mutator may be async: pnpm runs in a child process so a slow
+      // update cannot freeze the window, and that means awaiting here.
+      const outcome = await mutator(dir, installDir);
       return { message: outcome.message ?? `${label} 完成`, updater: outcome, checkpoint: checkpoint.id };
     }, { sizes: true });
   }
@@ -313,6 +315,17 @@ class RecoveryController {
   }
 
   async perform(action, mutator, options = {}) {
+    // Refuse a second mutation while one is running.
+    //
+    // `busy` used to be display-only. The window disables its buttons from the
+    // same flag, but that is a *render* away: a fast double-click, or the two
+    // panes of a split view, could start two pnpm runs against one profile.
+    // They then fight over the same lockfile and node_modules, and the loser
+    // reports a corruption the user did not cause. The guard is authoritative
+    // here, not in the UI.
+    if (this.busy === true) {
+      throw new Error("另一个插件操作还在进行中。请等它结束（或超时中止）后再试，同时在跑两个 pnpm 会互相破坏同一个 Profile。");
+    }
     this.busy = true;
     try {
       const result = await mutator();
@@ -501,16 +514,61 @@ class RecoveryController {
         // The channels answer with { ok: false } instead of throwing: dispatch()
         // is also called directly by --verify, where a throw would abort the run.
         if (spec === "") return { ok: false, error: "缺少要安装的插件名", state: this.state };
+        // A GitHub reference is resolved to the npm package it publishes; the
+        // actual install is still `pnpm add <name>`, never a source checkout.
+        const fromGithub = updater.looksLikeGithub(spec);
         if (args[1] === true) {
           const dir = this.requireUpdaterDir();
-          const outcome = updater.install(dir, spec, { installDir: updater.installDirOf(this.state?.selected), dryRun: true });
+          const installDir = updater.installDirOf(this.state?.selected);
+          if (fromGithub) {
+            // Resolving needs the network, so a preview reports what it found
+            // rather than pretending the install already ran.
+            const resolved = await updater.resolveGithubPackage(spec);
+            if (resolved?.error !== undefined) return { ok: false, error: resolved.error, state: this.state };
+            return {
+              ok: true,
+              result: {
+                message: `${spec} → ${resolved.name}${resolved.version === undefined ? "" : `@${resolved.version}`}（将安装 npm 上的这个包）`,
+                updater: { resolved },
+              },
+              state: this.state,
+            };
+          }
+          const outcome = await updater.install(dir, spec, { installDir, dryRun: true });
           return { ok: true, result: { message: outcome.message, updater: outcome }, state: this.state };
         }
         return this.runUpdater(`安装 ${spec}`, `安装 ${spec}`, (dir, installDir) =>
-          updater.install(dir, spec, { installDir }), {
+          updater.installFromInput(dir, spec, { installDir }), {
           needsPnpm: true,
           precheck: () => {
-            if (!updater.SPEC_PATTERN.test(spec)) throw new Error(`拒绝把 ${JSON.stringify(spec)} 交给 pnpm`);
+            // Free-form specs are validated here; a repository reference is
+            // validated by resolution, which happens inside the mutator.
+            if (!fromGithub && !updater.SPEC_PATTERN.test(spec)) {
+              throw new Error(`拒绝把 ${JSON.stringify(spec)} 交给 pnpm`);
+            }
+          },
+        });
+      }
+
+      case "recovery:plugin-install-market": {
+        // The market itself is the one plugin that cannot be installed from
+        // inside the app when it is missing, so the panel offers it here. It is
+        // a plain install of a fixed package name — no free-form spec — which
+        // keeps this channel from becoming a second install entry point.
+        if (args[0] === true) {
+          const dir = this.requireUpdaterDir();
+          const outcome = updater.installMarket(dir, {
+            installDir: updater.installDirOf(this.state?.selected),
+            dryRun: true,
+          });
+          return { ok: true, result: { message: outcome.message, updater: outcome }, state: this.state };
+        }
+        return this.runUpdater("安装插件市场", "安装插件市场", (dir, installDir) =>
+          updater.installMarket(dir, { installDir }), {
+          needsPnpm: true,
+          precheck: (dir) => {
+            const market = updater.marketState(dir);
+            if (market.installed) throw new Error(`${market.name} 已经安装在这个 profile 里；请改用「升级到最新」`);
           },
         });
       }

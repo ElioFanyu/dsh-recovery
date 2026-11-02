@@ -218,8 +218,14 @@ function buildFixture(root) {
   const listDir = path.join(root, "awesome-list");
   ensureDir(path.join(listDir, "data", "plugins"));
   writeJsonAtomic(path.join(listDir, "package.json"), { name: "awesome-dsh-plugin", version: "0.1.0" });
+  // The "somebody else's entry" is listed under a *legacy* filename on purpose.
+  // R13 reports the same URL under the filename this submission would generate
+  // as the submitter's own uncommitted draft (not a duplicate), so a genuine
+  // clash has to be a different file. Naming it differently also keeps the
+  // duplicate check independent of `readdir` order, which `listEntries` does not
+  // sort: with two files sharing the URL, `find` could return either.
   fs.writeFileSync(
-    path.join(listDir, "data", "plugins", "someone__verify-plugin.yml"),
+    path.join(listDir, "data", "plugins", "someone__verify-plugin-legacy.yml"),
     "url: https://github.com/someone/verify-plugin\nname: someone/verify-plugin\ncategory: tools\ndescription:\n  en: Another plugin.\n",
   );
 
@@ -354,10 +360,12 @@ async function verifyAwesome(controller, fixture, result) {
   const forced = await controller.dispatch("recovery:awesome-write", [{ allowUpdate: true }]);
   result.ok("收录: 明确允许时才更新已有条目", forced.ok === true && forced.result?.updated === true, errorText(forced));
 
-  // The existing entry belongs to somebody else and must survive untouched.
+  // The entry belongs to somebody else and must survive untouched — including
+  // the write below, which generates `someone__verify-plugin.yml` (the filename
+  // this submission maps to) and must not overwrite the legacy-named file.
   result.ok(
     "收录: 不触碰别人的条目",
-    fs.readFileSync(path.join(fixture.listDir, "data", "plugins", "someone__verify-plugin.yml"), "utf8").includes("Another plugin."),
+    fs.readFileSync(path.join(fixture.listDir, "data", "plugins", "someone__verify-plugin-legacy.yml"), "utf8").includes("Another plugin."),
   );
 
   // Writing needs a real clone: a directory without data/plugins is refused.
@@ -669,6 +677,269 @@ async function verifyPluginUpdater(controller, fixture, result) {
 
   const emptySpec = await controller.dispatch("recovery:plugin-install", ["", false]);
   result.ok("插件更新: 空的安装名被拒绝", emptySpec.ok === false, errorText(emptySpec));
+
+  // --- the market itself: install it when absent, update it when present ----
+  // The fixture has no market, which is exactly the "installed the app but not
+  // the market" shape the panel must offer 「安装插件市场」 for.
+  const marketBefore = controller.state.pluginUpdater?.market;
+  result.ok(
+    "插件更新: 没有市场时报告为未安装",
+    marketBefore !== undefined && marketBefore.installed === false && marketBefore.name === "dshmarket",
+    JSON.stringify(marketBefore),
+  );
+  const marketPreview = await controller.dispatch("recovery:plugin-install-market", [true]);
+  result.ok(
+    "插件更新: 安装市场的预览可用且不写入",
+    marketPreview.ok === true && !Object.hasOwn(depsOf(), "dshmarket") && !bundlesOf().includes("dshmarket"),
+    errorText(marketPreview) ?? marketPreview.result?.message,
+  );
+
+  // A package.json entry whose node_modules copy is gone is the broken-profile
+  // shape: it must still count as "not installed", so the panel offers an
+  // install (which repairs it) rather than an update that fails.
+  const declaredOnly = readJson(manifestPath);
+  declaredOnly.value.dependencies.dshmarket = "^1.0.0";
+  writeJsonAtomic(manifestPath, declaredOnly.value);
+  await controller.dispatch("recovery:refresh", []);
+  result.ok(
+    "插件更新: 只声明未落盘的市场算作未安装",
+    controller.state.pluginUpdater?.market?.installed === false,
+    JSON.stringify(controller.state.pluginUpdater?.market),
+  );
+
+  // With a real copy on disk the same channel must refuse instead of
+  // reinstalling over it, and the panel switches to 「升级到最新」.
+  ensureDir(path.join(fixture.profileDir, "node_modules", "dshmarket"));
+  writeJsonAtomic(path.join(fixture.profileDir, "node_modules", "dshmarket", "package.json"), {
+    name: "dshmarket",
+    version: "1.0.0",
+    dsh: { bundle: { patch: "./cordis.patch.yml" } },
+  });
+  fs.writeFileSync(path.join(fixture.profileDir, "node_modules", "dshmarket", "cordis.patch.yml"), "- insert: []\n");
+  await controller.dispatch("recovery:refresh", []);
+  result.ok(
+    "插件更新: 已安装的市场报告为已安装",
+    controller.state.pluginUpdater?.market?.installed === true &&
+      controller.state.pluginUpdater?.market?.version === "1.0.0",
+    JSON.stringify(controller.state.pluginUpdater?.market),
+  );
+  const marketAgain = await controller.dispatch("recovery:plugin-install-market", [false]);
+  result.ok(
+    "插件更新: 已安装时拒绝重复安装市场",
+    marketAgain.ok === false && /已经安装/u.test(errorText(marketAgain) ?? ""),
+    errorText(marketAgain),
+  );
+  removeEntry(path.join(fixture.profileDir, "node_modules", "dshmarket"));
+  const marketReset = readJson(manifestPath);
+  delete marketReset.value.dependencies.dshmarket;
+  writeJsonAtomic(manifestPath, marketReset.value);
+  await controller.dispatch("recovery:refresh", []);
+}
+
+/**
+ * 插件更新: a stalled pnpm must time out instead of freezing the console.
+ *
+ * This is the regression guard for "更新插件把软件卡死了". Two facts are
+ * asserted, and the second is the one that actually mattered: while the package
+ * manager is stuck, the process must keep turning its event loop — the previous
+ * `spawnSync` implementation blocked the whole Electron main process.
+ */
+async function verifyUpdaterStall(controller, fixture, result) {
+  const updater = require("./plugin-updater");
+  const work = path.join(fixture.root, "stall");
+  ensureDir(work);
+  writeJsonAtomic(path.join(work, "package.json"), { name: "stall-probe", private: true });
+
+  // A child that never exits, standing in for a pnpm stuck on a registry retry.
+  const hanging = {
+    command: process.execPath,
+    prefix: ["-e", "setTimeout(() => {}, 600000)", "--"],
+    env: {},
+    node: process.execPath,
+    source: "verify",
+  };
+
+  let ticks = 0;
+  const timer = setInterval(() => {
+    ticks += 1;
+  }, 50);
+  const started = Date.now();
+  let error;
+  try {
+    await updater.__runPnpm(work, hanging, ["--version"], { timeoutMs: 1200 });
+  } catch (caught) {
+    error = caught;
+  } finally {
+    clearInterval(timer);
+  }
+  const elapsed = Date.now() - started;
+
+  result.ok(
+    "插件更新: 卡住的 pnpm 会被超时中止",
+    error !== undefined && /没有结束/u.test(String(error.message)),
+    error === undefined ? "调用意外成功返回" : String(error.message).split("\n")[0],
+  );
+  result.ok(
+    "插件更新: 卡住期间主线程没有被冻结",
+    ticks >= 8,
+    `事件循环只跑了 ${ticks} 次（${elapsed}ms 内），说明主进程被阻塞`,
+  );
+  result.ok(
+    "插件更新: 中止在超时预算内发生",
+    elapsed < 20000,
+    `实际用时 ${elapsed}ms`,
+  );
+
+  // The panel must also warn before a run that stands a chance of stalling.
+  const risks = updater.updateRisks(fixture.profileDir);
+  result.ok(
+    "插件更新: 面板数据带上更新风险提示",
+    Array.isArray(controller.state.pluginUpdater?.risks),
+    JSON.stringify(risks),
+  );
+
+  // A second mutation while one is in flight must be refused, not interleaved.
+  let release;
+  const blocked = new Promise((resolve) => {
+    release = resolve;
+  });
+  const first = controller.perform("首个操作", async () => {
+    await blocked;
+    return { message: "first" };
+  });
+  await Promise.resolve();
+  // Dispatch throws for a refused mutation only when called directly; go through
+  // the same channel the window uses and assert on the refused result instead.
+  let second;
+  try {
+    second = await controller.perform("第二个操作", async () => ({ message: "second" }));
+  } catch (caught) {
+    second = { ok: false, error: caught instanceof Error ? caught.message : String(caught) };
+  }
+  release();
+  await first;
+  result.ok(
+    "插件更新: 并发操作被拒绝而不是同时写同一个 Profile",
+    second.ok === false && /还在进行中/u.test(String(second.error ?? "")),
+    second.error,
+  );
+  // The refusal must not leave the controller permanently busy.
+  const afterRefusal = await controller.perform("后续操作", async () => ({ message: "after" }));
+  result.ok("插件更新: 拒绝后仍可继续操作", afterRefusal.ok === true, afterRefusal.error);
+
+  removeEntry(work);
+}
+
+/**
+ * 插件更新: origin grouping and repository-URL installs.
+ *
+ * Two behaviours that are easy to regress and expensive to get wrong:
+ *
+ *   1. A `link:` plugin must be reported as local, and `update()` must refuse it.
+ *      "Upgrading" a linked working copy silently replaces the link with a
+ *      registry download, detaching the folder the user edits.
+ *   2. A GitHub URL must resolve to the npm package it publishes, and never be
+ *      handed to pnpm as a repository spec (which would clone and build).
+ */
+async function verifyUpdaterOriginAndGithub(controller, fixture, result) {
+  const updater = require("./plugin-updater");
+  const manifestPath = path.join(fixture.profileDir, "package.json");
+  const linkedName = "verify-linked-plugin";
+  const linkedTarget = path.join(fixture.root, "linked-working-copy");
+
+  // A real junction, which is what `link:` produces on Windows.
+  ensureDir(linkedTarget);
+  writeJsonAtomic(path.join(linkedTarget, "package.json"), {
+    name: linkedName,
+    version: "9.9.9",
+    dsh: { bundle: { patch: "./cordis.patch.yml" } },
+  });
+  fs.writeFileSync(path.join(linkedTarget, "cordis.patch.yml"), "- insert: []\n");
+  const linkPath = path.join(fixture.profileDir, "node_modules", linkedName);
+  removeEntry(linkPath);
+  fs.symlinkSync(linkedTarget, linkPath, "junction");
+
+  const withLink = readJson(manifestPath);
+  withLink.value.dependencies[linkedName] = `link:${linkedTarget.replace(/\\\\/gu, "/")}`;
+  writeJsonAtomic(manifestPath, withLink.value);
+  await controller.dispatch("recovery:refresh", []);
+
+  const rows = controller.state.pluginUpdater?.rows ?? [];
+  const linkedRow = rows.find((row) => row.name === linkedName);
+  const registryRow = rows.find((row) => row.name === FIXTURE_BUNDLE);
+  result.ok(
+    "插件更新: link: 插件被识别为本地插件",
+    linkedRow?.origin === "local" && registryRow?.origin === "registry",
+    JSON.stringify({ linked: linkedRow?.origin, registry: registryRow?.origin }),
+  );
+
+  // The backend, not just the panel, must refuse the upgrade.
+  let refused;
+  try {
+    await updater.update(fixture.profileDir, linkedName, { installDir: fixture.installDir });
+    refused = undefined;
+  } catch (error) {
+    refused = error instanceof Error ? error.message : String(error);
+  }
+  result.ok(
+    "插件更新: 本地插件拒绝升级（不会把 link 换成 registry 副本）",
+    typeof refused === "string" && /本地插件/u.test(refused),
+    refused,
+  );
+  result.ok(
+    "插件更新: 拒绝升级后 link 仍在",
+    fs.existsSync(linkPath) && readJson(manifestPath).value.dependencies[linkedName].startsWith("link:"),
+    readJson(manifestPath).value.dependencies[linkedName],
+  );
+
+  // Clean up so later checks see the original fixture.
+  removeEntry(linkPath);
+  const withoutLink = readJson(manifestPath);
+  delete withoutLink.value.dependencies[linkedName];
+  writeJsonAtomic(manifestPath, withoutLink.value);
+  await controller.dispatch("recovery:refresh", []);
+
+  // --- repository references ----------------------------------------------
+  // Parsing only: the resolution step needs the network, and a self test must
+  // not depend on GitHub being reachable.
+  const parses = [
+    ["https://github.com/dsh-market/dsh-market", { owner: "dsh-market", repo: "dsh-market" }],
+    ["github.com/a/b", { owner: "a", repo: "b" }],
+    ["git@github.com:a/b.git", { owner: "a", repo: "b" }],
+    ["a/b#packages/x", { owner: "a", repo: "b", subpath: "packages/x" }],
+  ];
+  const parseProblems = [];
+  for (const [input, expected] of parses) {
+    const got = updater.parseGithubRef(input) ?? {};
+    for (const [key, value] of Object.entries(expected)) {
+      if (got[key] !== value) parseProblems.push(`${input} → ${key}=${got[key]}，期望 ${value}`);
+    }
+  }
+  result.ok("插件更新: 能解析各种 GitHub 地址写法", parseProblems.length === 0, parseProblems.join("；"));
+
+  // A plain spec and a scoped package must NOT be mistaken for a repository.
+  const notRepos = ["dsh-ops", "@scope/name@1.2.3", "dsh-ops/extra"];
+  const misread = notRepos.filter((input) => updater.looksLikeGithub(input) === true);
+  result.ok("插件更新: 普通包名不会被误当成 GitHub 地址", misread.length === 0, misread.join("；"));
+
+  // An unresolvable repository must fail with an explanation, not a clone.
+  const unresolved = await updater.resolveGithubPackage("https://github.com/definitely-not-real-owner-xyz/nope", {
+    timeoutMs: 8000,
+  });
+  result.ok(
+    "插件更新: 读不到仓库 package.json 时给出说明",
+    unresolved?.error !== undefined && Array.isArray(unresolved.details),
+    JSON.stringify(unresolved).slice(0, 200),
+  );
+
+  // The install entry point must reject an empty box before touching pnpm.
+  let emptyRefused;
+  try {
+    await updater.installFromInput(fixture.profileDir, "   ", { installDir: fixture.installDir });
+  } catch (error) {
+    emptyRefused = error instanceof Error ? error.message : String(error);
+  }
+  result.ok("插件更新: 空的安装输入被拒绝", /请先填入/u.test(String(emptyRefused)), emptyRefused);
 }
 
 async function verifyCheckpoints(controller, fixture, result) {
@@ -919,6 +1190,8 @@ async function runVerify({ version, targets }) {
 
     await verifyPluginManagement(controller, fixture, result);
     await verifyPluginUpdater(controller, fixture, result);
+    await verifyUpdaterStall(controller, fixture, result);
+    await verifyUpdaterOriginAndGithub(controller, fixture, result);
     await verifyAwesome(controller, fixture, result);
     await verifyCheckpoints(controller, fixture, result);
     await verifyTargets(controller, fixture, result);
