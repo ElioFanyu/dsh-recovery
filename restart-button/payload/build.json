@@ -1,19 +1,19 @@
 {
-  "builtAt": "2026-10-30T03:44:54.121Z",
+  "builtAt": "2026-11-06T04:07:42.505Z",
   "asar": "D:\\Dev Tools\\DeepSeek Harness\\resources\\app.asar",
   "source": "D:\\Workspace\\DeepSeek Harness\\.dsh-src\\lib",
   "targets": [
     {
       "file": "main.js",
-      "bytes": 516716,
-      "padding": 40,
-      "target": 516716
+      "bytes": 838520,
+      "padding": 106,
+      "target": 838520
     },
     {
       "file": "preload-app.cjs",
-      "bytes": 41075,
+      "bytes": 128716,
       "padding": 9,
-      "target": 41075
+      "target": 128716
     }
   ]
 }

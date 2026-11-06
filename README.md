@@ -267,6 +267,37 @@ dsh-recovery/
 
 ## 版本记录
 
+### 2026-11-06 · v1.4.0 · 适配 DSH 0.2.2-rc.1（重启按钮补丁重新适配）
+
+- 版本号 `1.3.1` → `1.4.0`（`app/package.json` 与 `restart-button/lib/patch.cjs` 的
+  `TOOL_VERSION` 同步）。
+- 官方把桌面壳从 **0.2.1-rc.5** 换到 **0.2.2-rc.1**：`resources\app.asar` 整体替换为
+  **213202918 B**，重启按钮补丁随之丢失（这就是「重启按钮又没了」的直接原因）。
+  两个被改写的条目都**接近翻倍**：`lib/main.js` 516716 → **838520 B**，
+  `lib/preload-app.cjs` 41075 → **128716 B**。
+- 重新解包、重建载荷并重装：新载荷 `lib/main.js` = `95f95ca2…`（838520 B）、
+  `lib/preload-app.cjs` = `a0b7da29…`（128716 B）。旧的 rc.5 备份已归档到
+  `restart-button\backup\v021-rc5-2026-11-06T03-59-19\`，根备份换成本次 0.2.2-rc.1 原始字节
+  （`f42ed25b…` / `d6126b35…`）——**这一步必须做**，否则 `revert` 会用旧版本字节去改写新归档。
+- `restart-button\lib\build-payload.cjs` 的编辑表新增**多候选匹配**：同一条改动可以列出多个
+  上游写法，由 `pickCandidate()` 选「恰好命中一次」的那个；两个同时命中会直接报错而不是误改。
+  这次用上了两处：
+  1. `applicationItems()` 里的开发块换了排版（0.2.1 是 `? [\n{ type: "separator" },` +
+     花括号另起，0.2.2 内联成 `? [{`）；
+  2. `DesktopHostProcess` 构造函数新增 `onPluginOperation` 参数，JSDoc 多一行。
+  其余锚点（`applicationItems`、`windowsMenu` 白名单、en/zh 文案、`createButton`、方向键）逐字未变。
+- 等长取舍量：`main.js` 删 776 B 注释、加 1530 B 代码，剩 **106 B** 由填充注释吃下；
+  `preload-app.cjs` 删 209 B、加 200 B，剩 **9 B** 同样补齐（都在 `MAX_PAD = 400` 以内）。
+  两个载荷都过了 `node --check`；`git diff --no-index` 只有预期的 6+3 个 hunk。
+- **整包往返复测**（在 asar 副本上，用线上真实备份）：`revert` → 官方原始
+  `5fa8a6b2…` → `apply` → 回到补丁态 `ddac77a0…`，`verify` 0 失败；副本大小恒为 213202918 B，
+  条目偏移（`205702663` / `206682527`）与文件数（22102）全程未变，测试产物已删除。
+- 线上 `apply` 后 `status` 报两个条目「已安装（= 载荷）」、头部 integrity 一致、有原始备份；
+  `--self-check` ok（目标识别为 **0.2.2-rc.1** / Electron 44.7.0）、`--ui-check` ok（9 页签、0 问题，
+  「重启按钮」页签显示「已安装 2/2」且「安装补丁」按钮正确禁用）、`--verify` 96/96。
+  自检前后 `dsh-recovery.config.json` 的 sha256 未变。
+- 真机上仍需**重启 DeepSeek Harness** 才会出现「重启」菜单；重启会结束当前会话，所以这一步留给用户确认。
+
 ### 2026-10-30 · v1.3.1 · 分组改称「联网插件」
 
 - 「网上安装的插件」改名为 **「联网插件」**：与「本地插件」「内置组件」都是四个字，

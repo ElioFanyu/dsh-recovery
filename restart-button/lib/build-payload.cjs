@@ -77,7 +77,11 @@ const MAIN_INSERT = lines(
 );
 
 // The reload/restart entries no longer belong to the Application menu.
-const MAIN_DEV_BLOCK = lines(
+//
+// Two spellings exist upstream: 0.2.1 writes the separators on their own lines,
+// 0.2.2 inlines the braces (`? [{`). Both are accepted and the first one that
+// matches is removed, so the same build handles either source layout.
+const MAIN_DEV_BLOCK_OLD = lines(
   "\t\t...development ? [",
   "\t\t\t{ type: \"separator\" },",
   "\t\t\t{",
@@ -95,6 +99,23 @@ const MAIN_DEV_BLOCK = lines(
   "\t\t] : [],",
   ""
 );
+
+const MAIN_DEV_BLOCK_NEW = lines(
+  "\t\t...development ? [{",
+  "\t\t\tlabel: currentDesktopLocale().messages.reloadPageMenu,",
+  "\t\t\trole: \"reload\"",
+  "\t\t}, {",
+  "\t\t\tlabel: currentDesktopLocale().messages.restartAppHostMenu,",
+  "\t\t\tclick: () => {",
+  "\t\t\t\tif (quitting) return;",
+  "\t\t\t\tapp.relaunch();",
+  "\t\t\t\tquitWithoutConfirmation();",
+  "\t\t\t}",
+  "\t\t}] : [],",
+  ""
+);
+
+const MAIN_DEV_BLOCK = [MAIN_DEV_BLOCK_NEW, MAIN_DEV_BLOCK_OLD];
 
 const edits = [
   {
@@ -162,20 +183,40 @@ const edits = [
   {
     file: "main.js",
     name: "精简 Host 子进程构造函数文档注释（等长代价）",
-    from: lines(
-      "\t* @param node - Absolute Electron executable in Node mode.",
-      "\t* @param runtimeDir - Immutable packages carried by the current application.",
-      "\t* @param projectDir - Desktop plugin profile and child working directory.",
-      "\t* @param inspectPort - Optional loopback inspector port for workspace development.",
-      "\t* @param environment - Environment inherited by the Host and its plugin subprocesses.",
-      "\t* @param onFailure - Receives the first unexpected child failure, including after readiness.",
-      "\t* @param primaryRuntime - Optional bundled dependency payload; when supplied, missing sibling",
-      "\t*   `office-skills` resources fail Host startup.",
-      "\t* @param packageManager - Bundled pnpm entry and Node launcher directory, scoped to package operations.",
-      "\t* @param onPlatformSession - Private credential updates for embedded Platform views.",
-      "\t*/",
-      ""
-    ),
+    from: [
+      // 0.2.2 added the `onPluginOperation` parameter; the longer variant must be
+      // listed first only for readability — order does not matter, exactly one
+      // of them can match a given source.
+      lines(
+        "\t* @param node - Absolute Electron executable in Node mode.",
+        "\t* @param runtimeDir - Immutable packages carried by the current application.",
+        "\t* @param projectDir - Desktop plugin profile and child working directory.",
+        "\t* @param inspectPort - Optional loopback inspector port for workspace development.",
+        "\t* @param environment - Environment inherited by the Host and its plugin subprocesses.",
+        "\t* @param onFailure - Receives the first unexpected child failure, including after readiness.",
+        "\t* @param primaryRuntime - Optional bundled dependency payload; when supplied, missing sibling",
+        "\t*   `office-skills` resources fail Host startup.",
+        "\t* @param packageManager - Bundled pnpm entry and Node launcher directory, scoped to package operations.",
+        "\t* @param onPlatformSession - Private credential updates for embedded Platform views.",
+        "\t* @param onPluginOperation - Optional diagnostic sink; malformed records are ignored without failing the Host.",
+        "\t*/",
+        ""
+      ),
+      lines(
+        "\t* @param node - Absolute Electron executable in Node mode.",
+        "\t* @param runtimeDir - Immutable packages carried by the current application.",
+        "\t* @param projectDir - Desktop plugin profile and child working directory.",
+        "\t* @param inspectPort - Optional loopback inspector port for workspace development.",
+        "\t* @param environment - Environment inherited by the Host and its plugin subprocesses.",
+        "\t* @param onFailure - Receives the first unexpected child failure, including after readiness.",
+        "\t* @param primaryRuntime - Optional bundled dependency payload; when supplied, missing sibling",
+        "\t*   `office-skills` resources fail Host startup.",
+        "\t* @param packageManager - Bundled pnpm entry and Node launcher directory, scoped to package operations.",
+        "\t* @param onPlatformSession - Private credential updates for embedded Platform views.",
+        "\t*/",
+        ""
+      )
+    ],
     to: lines(
       "\t* Host child parameters are documented on the assignments below.",
       "\t*/",
@@ -237,11 +278,24 @@ const edits = [
 ];
 
 const byteLength = (text) => Buffer.byteLength(text, "utf8");
+
+/** Turns `from` into a list so one edit can accept several upstream spellings. */
+const candidates = (edit) => (Array.isArray(edit.from) ? edit.from : [edit.from]);
+
+/** Picks the one candidate that appears exactly once, or explains what was found. */
+const pickCandidate = (text, edit) => {
+  const counts = candidates(edit).map((from) => ({ from, hits: text.split(from).length - 1 }));
+  const unique = counts.filter((candidate) => candidate.hits === 1);
+  if (unique.length === 1) return unique[0].from;
+  if (unique.length > 1) throw new Error(`${edit.file}: 「${edit.name}」有多个候选同时匹配（${unique.length} 个），无法确定改哪一处`);
+  const seen = counts.map((candidate) => candidate.hits).join("/");
+  throw new Error(`${edit.file}: 「${edit.name}」匹配次数为 ${seen}（需要其中一个为 1 次）`);
+};
+
 const apply = (text, edit) => {
-  const hits = text.split(edit.from).length - 1;
-  if (hits !== 1) throw new Error(`${edit.file}: 「${edit.name}」匹配 ${hits} 次（需要 1 次）`);
+  const from = pickCandidate(text, edit);
   const replacement = typeof edit.to === "function" ? edit.to() : edit.to;
-  return text.replace(edit.from, replacement);
+  return text.replace(from, replacement);
 };
 
 const main = () => {

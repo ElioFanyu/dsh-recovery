@@ -4,7 +4,7 @@
 > 同一份实现既提供**恢复器界面里的「重启按钮」页签**（一键安装 / 校验 / 还原），
 > 也保留下面这套**命令行入口**（DSH 完全起不来、连恢复器都不想开时用）。
 
-给官方 **DeepSeek Harness** 桌面壳（`@deepseek-ai/dsh-desktop` 0.2.1-rc.5）的标题栏菜单栏
+给官方 **DeepSeek Harness** 桌面壳（`@deepseek-ai/dsh-desktop` 0.2.2-rc.1）的标题栏菜单栏
 加一个 **「重启」** 按钮，位置在「应用」「编辑」右侧。
 
 菜单结构变化（只动这两处）：
@@ -30,10 +30,12 @@
 
 ![「重启按钮」页签](../docs/restart-button-tab.png)
 
-**本机当前状态（2026-10-30 复核，DSH 0.2.1-rc.5）**：官方从 rc.3 升到 rc.5 后 `app.asar` 被整体替换
-（出新字节 `e1b6f25f…`，182766714 B），补丁随之消失。已按下面「升级流程」重新解包、重建载荷并重装，
-线上整包现为补丁态 `66d7ff28…`（同样 182766714 B，偏移与长度均未变），`status` 报两个条目
+**本机当前状态（2026-11-06 复核，DSH 0.2.2-rc.1）**：官方从 rc.5 升到 0.2.2-rc.1 后 `app.asar` 被整体替换
+（213202918 B），补丁随之消失。已按下面「升级流程」重新解包、重建载荷并重装，`status` 报两个条目
 「已安装（= 载荷）」，恢复器页签显示「已安装 2/2 · 头部 integrity 一致 · 有原始备份」。
+
+这次上游改动比以往大：`lib/main.js` 516716 → **838520 B**，`lib/preload-app.cjs` 41075 → **128716 B**
+（体积翻倍），所以**旧的载荷与旧备份都不能再用**——见下面「升级流程」第 2 步。
 
 **方式二：命令行**（本目录）：
 
@@ -83,8 +85,8 @@ patch.revert({ archive });   // 用备份字节还原
 因此任何改变文件长度的写法都会平移后续所有条目，**正在运行的窗口会开始读到错位数据**；
 新增文件同样会让头部 JSON 变长、平移全部偏移。本工具因此只做一件事：
 
-> 用**长度完全等于头部 `size`** 的字节，原地覆盖 `lib/main.js`（516716 B）与
-> `lib/preload-app.cjs`（41075 B），并把头部里这两个条目的 `integrity.hash` / `blocks[]`
+> 用**长度完全等于头部 `size`** 的字节，原地覆盖 `lib/main.js`（838520 B）与
+> `lib/preload-app.cjs`（128716 B），并把头部里这两个条目的 `integrity.hash` / `blocks[]`
 > 哈希串替换为新内容的 sha256（同为 64 个十六进制字符，长度不变）。
 
 结果是：**偏移、长度、头部结构全部不变**，所以可以在 DSH 运行中直接安装，
@@ -106,19 +108,32 @@ node lib\build-payload.cjs --write  :: 生成 payload\lib\{main.js,preload-app.c
 
 - 源码基线：`D:\Workspace\DeepSeek Harness\.dsh-src\lib\{main.js,preload-app.cjs}`（**未打补丁**的
   解包副本，`build-payload.cjs` 的默认 `DSH_PATCH_SRC`，可用同名环境变量覆盖）。
-  当前这份基线是 **0.2.1-rc.5**：`main.js` 516716 B（sha256 `9712da3c…`）、
-  `preload-app.cjs` 41075 B（sha256 `f323eb67…`）。官方再更新时按「升级流程」重新解一遍再指过去。
+  当前这份基线是 **0.2.2-rc.1**：`main.js` 838520 B（sha256 `f42ed25b…`）、
+  `preload-app.cjs` 128716 B（sha256 `d6126b35…`）。官方再更新时按「升级流程」重新解一遍再指过去。
 - 目标长度从 asar 头部实时读取，不写死；长度不符会直接报错中止。
-- 生成的载荷已通过 `node --check`；当前载荷（0.2.1-rc.5）sha256：
-  - `lib/main.js` → `839f7757be61f00f54925530b70fb0f48b42208fe7ced6be4bf75f3f25adcc95`
-  - `lib/preload-app.cjs` → `e42784d0f4c072af03f78b2aba02ade4c6ed81609ae30e8320b67b3647116992`
-    （rc.3 → rc.5 这个文件一字未动，所以哈希与上一版相同）
+- 生成的载荷已通过 `node --check`；当前载荷（0.2.2-rc.1）sha256：
+  - `lib/main.js` → `95f95ca20821155d19338120c04f1a5e04bcf15c84ed6e3ba9a40057c9dad4d0`
+  - `lib/preload-app.cjs` → `a0b7da294f4b5a4519dd90168b12e6dc57ded6430edcb940330c171f3041f370`
+
+### 上游改动对补丁的影响（0.2.2-rc.1）
+
+升级后 `build-payload.cjs` 的编辑表有两处**必须跟着改**，否则重建会直接报「匹配 0 次」中止：
+
+1. 开发块换了排版。0.2.1 写作 `...development ? [\n  { type: "separator" },`（分隔线单独一行、
+   花括号另起），0.2.2 内联成 `...development ? [{`。编辑表现在**同时接受两种写法**，
+   由 `pickCandidate()` 选「恰好命中一次」的那个；两个都命中会直接报错，不会误删。
+2. `DesktopHostProcess` 构造函数新增了 `onPluginOperation` 参数，多出一行 JSDoc。
+   该条编辑同样改成两个候选（带/不带新参数行）。
+
+其余锚点（`applicationItems`、`windowsMenu` 白名单、en/zh 文案、`createButton`、方向键）逐字未变。
+本次等长取舍量：`main.js` −776 B 注释、+1530 B 代码，剩 106 B 由填充注释吃下；
+`preload-app.cjs` −209 B 注释、+200 B 代码，剩 9 B 同样由填充注释补齐（都在 `MAX_PAD = 400` 以内）。
 
 ## 改动内容（逐处）
 
 `lib/main.js`
 
-1. 删掉 `applicationItems()` 里的开发块（`...development ? [ 分隔线, 刷新页面, 重启应用与 Host ] : []`，−324 B）。
+1. 删掉 `applicationItems()` 里的开发块（`...development ? [ 分隔线, 刷新页面, 重启应用与 Host ] : []`，0.2.2 上 −278 B）。
 2. 新增 `RECOVERY_CONSOLE` / `launchRecoveryConsole()` / `restartItems()`（+1371 B）：
 
 ```js
@@ -158,7 +173,7 @@ const launchRecoveryConsole = () => new Promise((resolve) => {
 | `lib/apply.cjs` | 上面那个库的 `status` / `verify` / `apply` / `revert` 命令行外壳 |
 | `lib/inspect.cjs`、`lib/list.cjs`、`lib/find-slack.cjs` | 侦查工具：列 asar 条目、看条目 sha256/integrity、找可裁剪的注释块 |
 | `payload/lib/*`、`payload/build.json` | 生成好的载荷字节与其哈希 |
-| `backup/*.orig`、`backup/manifest.json` | **安装前**两个条目的原始字节（516716 + 41075 ≈ 545 KB），`revert` 的来源 |
+| `backup/*.orig`、`backup/manifest.json` | **安装前**两个条目的原始字节（838520 + 128716 ≈ 945 KB），`revert` 的来源 |
 | `state.json` | 最近一次 `apply` 的记录（时间、哈希、头部哈希串更新处数） |
 | `config.cmd`、`install.cmd`、`status.cmd`、`verify.cmd`、`revert.cmd` | 命令行入口（自动查找 node，`DSH_ASAR` 可覆盖目标） |
 
@@ -166,21 +181,22 @@ const launchRecoveryConsole = () => new Promise((resolve) => {
 
 ## 已验证的事实
 
-1. **等长**：载荷长度 516716 / 41075，与头部 `size` 完全一致；`apply` 对长度不符的情况直接中止，
+1. **等长**：载荷长度 838520 / 128716，与头部 `size` 完全一致；`apply` 对长度不符的情况直接中止，
    且在写任何字节之前完成备份。
 2. **可逆（整包级别）**：在 asar **副本**上做 `revert` → `apply` → `verify`，
    两次改写各动 2 个条目，最后整包 sha256 与操作前**完全相同**：
-   - 副本来自当前线上补丁态整包 `66d7ff28040723719f8cf669dd42e7cf1e126d25705b788d689ab06e545e2e42`（182766714 B，0.2.1-rc.5）；
-   - `revert`（touched 2）→ 得到官方原始整包 `e1b6f25fa937da98086c3e77af77aa14791105963c4d337a1c42179d232c6915`；
-   - `apply`（changed 2）→ 又回到 `66d7ff28…`，`verify` failures 0；副本与临时文件随后删除。
-   早期版本（0.2.0-rc.2、0.2.1-rc.2、0.2.1-rc.3）上也做过同样的 `apply → verify → revert` 往返，
+   - 副本来自当前线上补丁态整包 `ddac77a0ef2233768885126d1076982f56c54bbf2e1dbf2f2fee75753e15741a`（213202918 B，0.2.2-rc.1）；
+   - `revert`（touched 2）→ 得到官方原始整包 `5fa8a6b21bceb8f3e99e30efa2270efd0cc773a11e42aa0488f804a64b34e637`；
+   - `apply`（changed 2）→ 又回到 `ddac77a0…`，`verify` failures 0；副本与临时文件随后删除。
+   早期版本（0.2.0-rc.2、0.2.1-rc.2、0.2.1-rc.3、0.2.1-rc.5）上也做过同样的 `apply → verify → revert` 往返，
    当时分别复原到 `3f5cc17f99209f36799a373e0741d4890dbc384d2020877cd2755d9305c4e3a7`、
    `47874618bf5b3011fcaac10cd4c85f69da333e70d4f99b921207c78d0999512a`、
-   `04b32e3a872826ba15cfb2081c6a929a8d4ecaa65e09a2543e5a6b30e2eff1f0`；
+   `04b32e3a872826ba15cfb2081c6a929a8d4ecaa65e09a2543e5a6b30e2eff1f0`、
+   `e1b6f25fa937da98086c3e77af77aa14791105963c4d337a1c42179d232c6915`；
    并入恢复器后又用**界面按钮走的同一套代码**（`app\backend\restart-button.js`）复测过一遍。
 3. **头部自洽**：两个条目的 `integrity.hash` 与 `blocks[0]` 都被同步为新内容哈希，
    回读校验为「头部 integrity 与内容一致（1 块）」，`node --check` 通过。
-4. **语义核对**：`git diff --no-index ..\.dsh-src\lib\<file> payload\lib\<file>` 的 8+5 个 hunk
+4. **语义核对**：`git diff --no-index ..\.dsh-src\lib\<file> payload\lib\<file>` 的 6+3 个 hunk
    与上面的改动清单逐行一致（除此之外没有别的差异）。
 5. **恢复器启动方式**：用独立 Node 探针按 `launchRecoveryConsole` 的完全相同参数
    （`detached`、`stdio:"ignore"`、删除 `ELECTRON_RUN_AS_NODE`）拉起 `.runtime\dsh-recovery.exe`，
@@ -196,7 +212,7 @@ const launchRecoveryConsole = () => new Promise((resolve) => {
 - **必须重启 DSH 才生效**：`lib/main.js` / `lib/preload-app.cjs` 只在启动/建窗时读取。
   重启会结束当前这个会话（我运行在 DSH 内部），所以最终效果需要你重启后确认。
 - **官方更新会覆盖 asar**：DSH Desktop 升级后 `resources\app.asar` 会被替换，补丁消失，需要重打。
-  正确顺序（本机 0.2.0-rc.2 → 0.2.1-rc.2 → 0.2.1-rc.3 → 0.2.1-rc.5 都踩过）：
+  正确顺序（本机 0.2.0-rc.2 → 0.2.1-rc.2 → 0.2.1-rc.3 → 0.2.1-rc.5 → 0.2.2-rc.1 都踩过）：
   1. 用 `lib/extract.cjs`（或等价的 asar 读取）把官方新的 `lib/main.js`、`lib/preload-app.cjs`
      解到 `..\.dsh-src\lib\`，覆盖旧基线；
   2. **先把旧的 `backup\` 根目录里的 `*.orig` 与 `manifest.json` 搬走**——`apply` 只保留"首份备份"。
@@ -207,10 +223,13 @@ const launchRecoveryConsole = () => new Promise((resolve) => {
   4. `node lib\apply.cjs apply`，再 `status` / `verify` 确认。asar 大小与偏移全程不变。
   0.2.1-rc.5 这次 rc.3 → rc.5 的 `lib/main.js` **只差一行**（`desktopClientVersion()` 里的版本字符串），
   `preload-app.cjs` 完全相同，所以载荷里只有 `main.js` 的哈希变了。
+  0.2.2-rc.1 这次则是**大改**：两个文件都接近翻倍，编辑表里两个锚点（开发块排版、
+  `DesktopHostProcess` 的 JSDoc）随之更新；照旧流程走即可，`build-payload.cjs` 会在锚点
+  匹配不到时直接报错，不会静默写出错误载荷。
 - **请用本工具的 `revert.cmd`**，不要用 `dsh-restart-menu-patch\revert.cmd`：后者会把 asar
   回滚到更早的原始构建，连「重启」按钮一起抹掉。
 - 安装/还原只改 `resources\app.asar` 里这两个条目（外加它们头部的哈希串），
   不触碰装机目录里的其它文件；`app.asar.dsh-restart-backup`（旧工具的整包备份）保持不动。
 - 恢复器路径可用环境变量 `DSH_RECOVERY_CONSOLE` 覆盖（在 DSH 的进程环境里设置）。
-- 仅针对本机这个版本（`@deepseek-ai/dsh-desktop` 0.2.1-rc.5，asar 182766714 B，
-  条目 lib/main.js 516716 B / lib/preload-app.cjs 41075 B）。
+- 仅针对本机这个版本（`@deepseek-ai/dsh-desktop` 0.2.2-rc.1，asar 213202918 B，
+  条目 lib/main.js 838520 B / lib/preload-app.cjs 128716 B）。

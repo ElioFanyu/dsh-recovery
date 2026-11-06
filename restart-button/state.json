@@ -1,20 +1,20 @@
 {
-  "toolVersion": "1.2.0",
-  "installedAt": "2026-10-30T03:45:30.386Z",
+  "toolVersion": "1.4.0",
+  "installedAt": "2026-11-06T04:07:46.122Z",
   "archive": "D:\\Dev Tools\\DeepSeek Harness\\resources\\app.asar",
   "entries": [
     {
       "entryPath": "lib/main.js",
       "action": "skip",
-      "hash": "839f7757be61f00f54925530b70fb0f48b42208fe7ced6be4bf75f3f25adcc95",
-      "size": 516716,
+      "hash": "95f95ca20821155d19338120c04f1a5e04bcf15c84ed6e3ba9a40057c9dad4d0",
+      "size": 838520,
       "note": "已经是载荷内容"
     },
     {
       "entryPath": "lib/preload-app.cjs",
       "action": "skip",
-      "hash": "e42784d0f4c072af03f78b2aba02ade4c6ed81609ae30e8320b67b3647116992",
-      "size": 41075,
+      "hash": "a0b7da294f4b5a4519dd90168b12e6dc57ded6430edcb940330c171f3041f370",
+      "size": 128716,
       "note": "已经是载荷内容"
     }
   ],
