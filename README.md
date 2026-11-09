@@ -1,7 +1,7 @@
 # DSH 恢复器（dsh-recovery）
 
 一个**独立的桌面恢复控制台**，让 DeepSeek Harness 在无法正常启动时仍然可以被修复。
-九个标签页：快速恢复 / 插件管理 / **插件更新** / 回滚 / **收录插件** / 重启按钮 / 切换 Profile / 重置与数据管理 / 诊断。
+十个标签页：快速恢复 / 插件管理 / **插件更新** / 回滚 / **收录插件** / 重启按钮 / 切换 Profile / **环境备份** / 重置与数据管理 / 诊断。
 
 ![快速恢复](docs/quick-recovery-tab.png)
 
@@ -13,7 +13,9 @@
 | --- | --- | --- |
 | ![回滚](docs/checkpoints-tab.png) | ![重启按钮](docs/restart-button-tab.png) | ![诊断](docs/diagnostics-tab.png) |
 
-![收录插件](docs/awesome-tab.png)
+| 收录插件 | 环境备份 |
+| --- | --- |
+| ![收录插件](docs/awesome-tab.png) | ![环境备份](docs/backup-tab.png) |
 
 ## 为什么不做成 DSH 插件
 
@@ -72,7 +74,7 @@ setup-runtime.cmd --list
 | `--profile=<名称>` | 要操作的 Profile，默认 `desktop` |
 | `--home=<目录>` | DSH 数据目录，默认取环境变量 `DSH_HOME`，否则 `%USERPROFILE%\.dsh` |
 
-## 九个标签页
+## 十个标签页
 
 | 页面 | 能力 |
 | --- | --- |
@@ -83,8 +85,83 @@ setup-runtime.cmd --list
 | **收录插件** | 按 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 的 `contributing.md` 逐条核对插件仓库，生成可直接提交的 `data/plugins/<owner>__<repo>.yml`；「必须修正」可**一键复制给 AI 修改**；指定列表克隆后还能查重并写入。**只读**，不需要停止 DSH。规则与流程见 [docs/awesome-plugin-submission.md](docs/awesome-plugin-submission.md) |
 | 重启按钮 | 给官方 `app.asar` 安装/校验/还原**「重启」菜单补丁**（菜单栏「应用」「编辑」右侧多一个「重启」，内含刷新页面 / 重启应用与 Host / 重启到恢复模式）；显示两个条目的判定、头部 integrity 与备份状态 |
 | 切换 Profile | 列出可用 Profile（插件数/补丁数），切换当前 Profile；「新建 Profile」交由 DSH 自身的初始化流程完成 |
+| **环境备份** | 把「换电脑 / 重装后需要重新配置」的东西打成一个 `.zip`：Profile 清单、补丁层（各插件的设置）、技能目录、各插件自己的设置文件；联网插件记 npm 包名与版本，本地插件记路径 + git remote + 提交。恢复时先预览要改什么，再写回配置、按 remote clone 本地插件、用 pnpm 重装联网插件。**凭据默认不含**，需要时单独导出。详见下文 |
 | 重置与数据管理 | 查看/更改 DSH 数据目录、恢复默认；**恢复出厂设置**（把当前数据目录移入回收站并重启） |
 | 诊断 | 「安装位置」卡：**手动选择安装目录或应用主程序**（自动扫描未覆盖时可指定，可切换、可移除）；导出诊断包（日志 + Profile 配置，本地保存、不上传）、在文件夹中显示、打开 `settings.yaml` / Profile 清单 / 插件补丁 / Profile 目录 |
+
+### 环境备份：搬家一次，不用重新配一遍
+
+DSH 的配置散落在数据目录的十几个位置：Profile 的 `package.json` 与 `cordis.patch.yml`、
+`~/.dsh/skills` 和 `~/.agents/skills` 下的技能、各插件自己的 JSON、工作区清单、MCP 连接器配置……
+换电脑或重装后这些都不在了，而重装插件、重贴 Key、重新调一遍每个插件的设置非常费时间。
+
+这个页签把**配置意图**打成一个 `.zip`，恢复时再把它写回去。
+
+![环境备份](docs/backup-tab.png)
+
+#### 备份什么
+
+| 分组 | 内容 | 为什么值得带上 |
+| --- | --- | --- |
+| Profile 与插件清单 | `package.json`（依赖 + 启用的插件层）、`cordis.patch.yml`（**每个插件的设置都在这里**）、`cordis.yml`、`pnpm-workspace.yaml`、`pnpm-lock.yaml` | 决定装什么、开什么、各插件怎么配 |
+| 插件设置 | 插件市场分组/区域/禁用表、技能管理器的自定义技能目录、华为云账号偏好、免费模型设置、渠道包设置、IM 侧栏与语言 | 这些是插件自己的 JSON，不在 Profile 里，容易被忽略 |
+| Agent 与专家 | `agency-expert-personas.json`、`agency-subagents.json`、`agency-subagent-ids.json` | 自定义专家人格与子代理登记 |
+| 工作区 | `storages/workspace.json`、`archive_manager_favorites.json` | 工作区路径、标题与排序 |
+| 技能 | `~/.dsh/skills/*` 与 `~/.agents/skills/*`，**整个目录**（不止 `SKILL.md`，随附脚本与资料一起走） | 自建技能往往是纯手工产物，丢了最心疼 |
+| MCP 连接器 | `storages/mcp_connector.json` | 已连接的服务器、治理策略与工具目录 |
+| 凭据（**需单独勾选**） | `.credentials.yaml`、`.dsh-connect-huawei/accounts.json`、`workbuddy-vault/`、`openai-gateway/api-key` | 不勾就要重新登录每家账号 |
+
+#### 不备份什么（页面里逐条列出，不藏）
+
+`node_modules`（能用 pnpm 重新装）、`sessions/`（会话历史）、`rewind-snapshots/`（回滚快照）、
+`attachments/`（对话附件）、`cache/`、`dsh-runtimes/`、`storages/session_projcache/`、
+IM 的群历史与群文件、`profiles/.dsh-recovery/`（恢复器自己的检查点）、
+以及恢复器自己的 `dsh-recovery.config.json`（那是本机设置，换机后本来就该重新指定）。
+
+#### 插件怎么记
+
+- **联网插件**：记 npm 包名与版本（`dshmarket@^1.73.14` 这种）。恢复后按清单跑一次
+  `pnpm install`，由 pnpm 装回来；版本写法原样保留，所以 `^` 范围也还在。
+- **本地插件**（`link:` 依赖）：源码**不在**包里（它们本来就在你自己的仓库里），
+  只记路径 + git remote + 提交 SHA。恢复时目录已存在就直接用，不存在就按 remote
+  clone 到原来的路径并切到记录的提交；没有 remote 的会在页面上标成「需要手动放置」。
+
+#### 恢复前会告诉你将要改什么
+
+选一个备份 → 「预览」会读出包内的 `manifest.json` 并逐项对比当前数据目录，
+给出 **新增 N / 覆盖 N / 相同 N / 技能 N**、本地插件的可恢复状态、以及包里带了什么。
+确认之后：
+
+1. 自动创建**检查点**（可随时从「回滚」页退回去）；
+2. 写回配置文件（Profile 清单**最后**写，因为它是下次启动去装插件的依据）；
+3. 按 remote clone 缺失的本地插件；
+4. 用 pnpm 重装联网插件（失败会明确报出来，配置已经写好了，可以只重试这一步）。
+
+#### 凭据：默认不带，带了就等于密码
+
+默认导出的包里**一个凭据都没有**——连文件名都看不到。需要时才点「导出备份（含凭据）」，
+并在确认框里看到明确警告：那个 `.zip` 等同于你的账号密码，不要上传到网盘公开目录或发给别人。
+
+还有一层防护：如果包里的 `manifest.json` 声明 `includesSecrets: false`，恢复时**任何**
+凭据类文件都会被跳过并记一条警告。清单说没带、实际却带了凭据的包，不会被写出去。
+
+#### 备份文件也是不可信输入
+
+备份是用户自己放进来的文件，所以恢复时会校验：
+
+- 包内每个文件都对照 `manifest.json` 里的 `sha256`，对不上就跳过（下载损坏不会静默生效）；
+- 条目名只接受已知位置：`profiles/<名称>/` 下只允许那五个 Profile 文件（不能借道写 `node_modules`），
+  `..` 一律拒绝（不能写到数据目录之外）；
+- 不是恢复器生成的包、ZIP64、加密条目、损坏的中央目录，都报明确错误而不是"尽力而为"。
+
+这三条都有断言守着，并**验证过断言有效**：把路径校验和凭据校验分别改坏后，
+`--verify` 立刻报「拒绝写到数据目录之外」和「声明不含凭据的包不还原凭据」失败。
+
+#### 备份文件放在哪
+
+`dsh-recovery\backups\`，文件名带时间戳与 Profile 名。这个目录在 `.gitignore` 里——
+它是本机配置（可能含凭据）的产物，**不会**被提交，也不该随手分享。
+
 
 ### 手动指定安装位置
 
@@ -199,10 +276,10 @@ DSH Desktop 的应用内更新有两个**宿主侧**缺陷，都定位到了具�
 | 命令 | 覆盖范围 | 是否改动磁盘 |
 | --- | --- | --- |
 | `--self-check` | 只读链路：目标探测、Profile 清单与补丁解析、检查点列表、运行状态 | 完全不写 |
-| `--verify` | 全部写操作：插件启用/禁用/**一键启用全部（含补丁层 disabled 解除）**/卸载/还原/永久删除、**插件来源分类（本地/联网/内置）与「打开」目标解析**、检查点创建/恢复/删除/**一键删除全部**、**手动指定/移除安装位置**（含无效目录拒绝）、**插件市场缺失/已装的判定与安装**、安全模式启动、停止（精确匹配进程）、诊断包导出 | 只写一次性 fixture 与 `.safemode\`，结束前自清理 |
-| `--ui-check` | 真开窗口渲染一遍界面：页签数量与名称、`window.recovery` 桥接口、两个「一键」按钮的存在与禁用态、**诊断页「安装位置」按钮**、**插件行「打开」按钮与来源标签**、**市场卡片按装没装显示「安装插件市场」或「升级到最新」**、**页脚在未运行/运行中两种状态下的按钮组合**（防 `undefined` 文字）、点开「重启按钮」页签后的活动面板与按钮可用性，并截图（含快速恢复 / 插件管理 / 插件更新 / 回滚 / 诊断五张附加截图） | 只写截图 |
+| `--verify` | 全部写操作：插件启用/禁用/**一键启用全部（含补丁层 disabled 解除）**/卸载/还原/永久删除、**插件来源分类（本地/联网/内置）与「打开」目标解析**、检查点创建/恢复/删除/**一键删除全部**、**手动指定/移除安装位置**（含无效目录拒绝）、**插件市场缺失/已装的判定与安装**、**环境备份导出/预览/恢复到空目录/恶意包拒绝**、安全模式启动、停止（精确匹配进程）、诊断包导出 | 只写一次性 fixture 与 `.safemode\`，结束前自清理 |
+| `--ui-check` | 真开窗口渲染一遍界面：页签数量与名称、`window.recovery` 桥接口、两个「一键」按钮的存在与禁用态、**诊断页「安装位置」按钮**、**插件行「打开」按钮与来源标签**、**市场卡片按装没装显示「安装插件市场」或「升级到最新」**、**页脚在未运行/运行中两种状态下的按钮组合**（防 `undefined` 文字）、点开「重启按钮」页签后的活动面板与按钮可用性、**「环境备份」页签的两个导出按钮与「不含凭据」措辞**，并截图（含快速恢复 / 插件管理 / 插件更新 / 回滚 / 环境备份 / 诊断六张附加截图） | 只写截图 |
 
-`--verify`（96 项检查）在每次运行时构造一个合成环境 `\.runtime\verify-<时间戳>\`：
+`--verify`（114 项检查）在每次运行时构造一个合成环境 `\.runtime\verify-<时间戳>\`：
 一份假的安装目录（`resources\app\package.json` 声明为 `@deepseek-ai/dsh-desktop`）和一份假的
 Profile，然后用**内存里的** `config` 指向它去跑真实动作，因此：
 
@@ -222,6 +299,11 @@ Profile，然后用**内存里的** `config` 指向它去跑真实动作，因�
 - **改 Profile 之前自动创建检查点**，检查点位于 `profiles\.dsh-recovery\checkpoints\<id>`。
 - 写入使用临时文件 + 原子替换；配置损坏时回退到默认值而不会让控制台失效。
 - 卸载 DSH 插件前校验它是组合包（`dsh.bundle.patch`）且确实在 Profile 依赖中，避免误删。
+- **环境备份默认不含凭据**：`.credentials.yaml`、登录令牌、accessKey 只有在你明确点
+  「导出备份（含凭据）」时才进包，且确认框会写明「等同于账号密码」。
+- **备份文件按不可信输入处理**：逐文件核对清单 `sha256`、条目路径不接受 `..` 与
+  `node_modules`、声明不含凭据的包拒绝还原任何凭据。`--verify` 有 5 项断言守着，
+  并且验证过断言确实能抓到回归。
 
 ## 目录结构
 
@@ -235,7 +317,7 @@ dsh-recovery/
     main.js               Electron 主进程（窗口、IPC 注册、--self-check / --verify / --ui-check）
     assets/               图标：icon.png（1024px，窗口用）+ icon.ico（16–256px 多尺寸，快捷方式用）
     preload.js            contextBridge：暴露 window.recovery.*
-    backend/              零依赖后端（paths/profile/checkpoints/diagnostics/zip/launcher/asar/ipc/util/verify/restart-button）
+    backend/              零依赖后端（paths/profile/checkpoints/diagnostics/zip/launcher/asar/ipc/util/verify/restart-button/backup）
     renderer/             原生 DOM 渲染界面（index.html / app.js / styles.css）
   tools/
     make-icon.py          重新生成 app/assets 下的 icon.png / icon.ico（Pillow）
@@ -244,6 +326,7 @@ dsh-recovery/
                           以及 --ui-check 的截图（ui-restart-tab*.png，docs/ 里的图即由此导出）
   docs/                   README 用的界面截图
   diagnostics/            导出的诊断包（按需创建）
+  backups/                环境备份的 .zip（按需创建，已在 .gitignore 中）
   dsh-recovery.config.json 记住的目标/Profile/数据目录
 ```
 
@@ -266,6 +349,32 @@ dsh-recovery/
 - 自动扫描只找常见根目录下的一层子目录；装在别处需要用**诊断 → 安装位置**手动指定（见上）。
 
 ## 版本记录
+
+### 2026-11-09 · v1.5.0 · 新增「环境备份」页签
+
+- 版本号 `1.4.0` → `1.5.0`。新增第十个页签，把「换电脑 / 重装 DSH 后要重新配的一切」
+  打包成一个 `.zip` 并可恢复（详见「环境备份」一节）。
+- 新增 `app/backend/backup.js`（约 940 行）：条目表、采集、打包、预览、恢复、
+  本地插件按 git remote 重建。设计上刻意只收**配置**，`node_modules`/会话/快照/附件/缓存
+  一律排除，并在页面上逐条列出排除原因。
+- `app/backend/zip.js` 新增 `readZip()`：只读的 ZIP 解析（stored + deflate，走内置 `zlib`，
+  零依赖），把 PowerShell/资源管理器写出的反斜杠条目名统一成 `/`。
+- 五个新通道：`backup-export` / `backup-choose-file` / `backup-preview` /
+  `backup-restore` / `backup-delete`。导出**不需要**停止应用（只读数据目录 + 写自己的文件）；
+  恢复走 `perform` + `requireIdle`，并且**先建检查点**，可随时回滚。
+- 凭据默认不含：`.credentials.yaml`、WorkBuddy 令牌、华为云 accessKey、网关 Key
+  只在你明确点「导出备份（含凭据）」时才会进包，确认框里有「等同于账号密码」的警告。
+- 备份文件是不可信输入，恢复时三重防护（都有断言守着）：逐文件比对清单里的 `sha256`、
+  条目路径只接受已知位置且拒绝 `..`、`includesSecrets: false` 的包**拒绝还原任何凭据**。
+  这三条**验证过断言有效**：把路径校验和凭据校验分别改坏后，`--verify` 立刻报
+  「拒绝写到数据目录之外」「拒绝写进 node_modules」「声明不含凭据的包不还原凭据」失败。
+- `backups/` 加进 `.gitignore`：本机配置（可能含凭据）的产物绝不进版本库。
+- 顺带修掉一个**真实的旧问题**：`.runtime` 还是 0.2.1-rc.5 的 Electron 硬链接，
+  与升级后的 dsh 动画 dll 不匹配，`--self-check` / `--ui-check` 一启动就
+  `EXCEPTION_BREAKPOINT` 崩溃。重新跑了 `setup-runtime.js`，现在指向 0.2.2-rc.1。
+  （另注：在 MSYS bash 里直接启动这个 exe 仍会崩，需经 PowerShell 启动——与代码无关。）
+- 自检：`--self-check` ok、`--ui-check` ok（**10 页签**、0 问题，新增环境备份面板的
+  按钮与「不含凭据」措辞断言 + 截图）、`--verify` **114/114**、单测 7/7。
 
 ### 2026-11-06 · v1.4.0 · 适配 DSH 0.2.2-rc.1（重启按钮补丁重新适配）
 

@@ -71,6 +71,11 @@ const CHANNELS = [
   "recovery:awesome-forget-dir",
   "recovery:awesome-check",
   "recovery:awesome-write",
+  "recovery:backup-export",
+  "recovery:backup-choose-file",
+  "recovery:backup-preview",
+  "recovery:backup-restore",
+  "recovery:backup-delete",
   "recovery:launch",
   "recovery:stop",
   "recovery:restart",
@@ -151,11 +156,12 @@ async function runUiCheck({ shot }) {
   // Nine panels: 收录插件 joined the eight so that adding a plugin to
   // awesome-dsh-plugin becomes a checked, guided operation instead of manual
   // YAML editing.
-  if (before.tabs.length !== 9) issues.push(`页签数量为 ${before.tabs.length}，期望 9`);
+  if (before.tabs.length !== 10) issues.push(`页签数量为 ${before.tabs.length}，期望 10`);
   if (!before.tabs.some((label) => label.includes("重启按钮"))) issues.push("页签中没有「重启按钮」");
   if (!before.tabs.some((label) => label.includes("插件更新"))) issues.push("页签中没有「插件更新」");
   if (!before.tabs.some((label) => label.includes("收录插件"))) issues.push("页签中没有「收录插件」");
-  if (before.panelCount !== 9) issues.push(`面板数量为 ${before.panelCount}，期望 9`);
+  if (!before.tabs.some((label) => label.includes("环境备份"))) issues.push("页签中没有「环境备份」");
+  if (before.panelCount !== 10) issues.push(`面板数量为 ${before.panelCount}，期望 10`);
   for (const method of [
     "restartButtonApply",
     "restartButtonRevert",
@@ -175,6 +181,11 @@ async function runUiCheck({ shot }) {
     "awesomeForgetDir",
     "awesomeCheck",
     "awesomeWrite",
+    "backupExport",
+    "backupChooseFile",
+    "backupPreview",
+    "backupRestore",
+    "backupDelete",
     "copyText",
     "openExternal",
   ]) {
@@ -391,7 +402,7 @@ async function runUiCheck({ shot }) {
   // Capture each panel that gained a one-click button (plus the overview
   // panel), so a ui-check run also leaves visual evidence for those screens.
   const extraShots = {};
-  for (const [panelId, suffix] of [["quick", "quick"], ["plugins", "plugins"], ["updater", "updater"], ["awesome", "awesome"], ["checkpoints", "checkpoints"], ["diagnostics", "diagnostics"]]) {
+  for (const [panelId, suffix] of [["quick", "quick"], ["plugins", "plugins"], ["updater", "updater"], ["awesome", "awesome"], ["checkpoints", "checkpoints"], ["backup", "backup"], ["diagnostics", "diagnostics"]]) {
     await win.webContents.executeJavaScript(`document.querySelector('[data-action="tab"][data-arg="${panelId}"]').click()`);
     await sleep(400);
     const file = shot.replace(/\.png$/i, `-${suffix}.png`);
@@ -427,6 +438,32 @@ async function runUiCheck({ shot }) {
   fs.mkdirSync(path.dirname(shot), { recursive: true });
   fs.writeFileSync(shot, image.toPNG());
 
+  // 环境备份: a read-only panel, so the assertions are about content reaching
+  // the DOM. The two export buttons must both be there — "含凭据" is a separate,
+  // deliberate click, not a checkbox someone can forget — and the secret groups
+  // must be visibly marked when they are not being included.
+  await win.webContents.executeJavaScript("document.querySelector('[data-action=\"tab\"][data-arg=\"backup\"]').click()");
+  await sleep(400);
+  const backupPanel = await win.webContents.executeJavaScript(
+    "(() => { const node = document.querySelector('.panel[data-active=\"true\"]'); return node === null ? null : { id: node.dataset.panel ?? null, text: node.innerText, buttons: [...node.querySelectorAll('button[data-action]')].map((button) => ({ action: button.dataset.action, arg: button.dataset.arg ?? null, label: button.textContent, disabled: button.disabled })) }; })()",
+  );
+  if (backupPanel === null) issues.push("点击「环境备份」页签后没有活动面板");
+  else {
+    if (backupPanel.id !== "backup") issues.push(`活动面板为 ${backupPanel.id}，期望 backup`);
+    for (const needle of ["打包这些内容", "Profile 与插件清单", "技能", "恢复"]) {
+      if (!backupPanel.text.includes(needle)) issues.push(`环境备份面板缺少「${needle}」`);
+    }
+    const exportButtons = backupPanel.buttons.filter((button) => button.action === "backup-export");
+    if (exportButtons.length !== 2) issues.push(`「导出备份」按钮为 ${exportButtons.length} 个，期望 2（不含凭据 / 含凭据）`);
+    if (!exportButtons.some((button) => button.arg === "secrets")) issues.push("缺少「导出备份（含凭据）」按钮");
+    if (!backupPanel.buttons.some((button) => button.action === "backup-choose-file")) issues.push("缺少「从文件恢复…」按钮");
+    // A backup panel that silently included credentials would be the single
+    // worst outcome of this feature, so the default wording is asserted.
+    if (!backupPanel.text.includes("不含凭据")) issues.push("面板没有声明「不含凭据」");
+    const image2 = await win.webContents.capturePage();
+    fs.writeFileSync(shot.replace(/\.png$/i, "-backup-tab.png"), image2.toPNG());
+  }
+
   return {
     issues,
     tabs: before.tabs,
@@ -434,6 +471,7 @@ async function runUiCheck({ shot }) {
     activePanel: panel?.id ?? null,
     buttons: panel?.buttons ?? [],
     panelText: panel?.text ?? "",
+    backup: backupPanel === null ? null : { actions: backupPanel.buttons.map((button) => `${button.action}${button.arg === null ? "" : `=${button.arg}`}`), text: backupPanel.text.slice(0, 600) },
     oneClick: {
       plugins: pluginsPanel?.actions.filter((button) => button.action === "enable-all-bundles") ?? [],
       checkpoints: checkpointsPanel?.actions.filter((button) => button.action === "delete-all-checkpoints") ?? [],

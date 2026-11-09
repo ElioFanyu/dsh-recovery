@@ -69,6 +69,13 @@ contextBridge.exposeInMainWorld("recovery", {
   awesomeCheck: (options) => invoke("recovery:awesome-check", options),
   awesomeWrite: (options) => invoke("recovery:awesome-write", options),
 
+  // --- 环境备份 (机器配置迁移) -------------------------------------------
+  backupExport: (options) => invoke("recovery:backup-export", options),
+  backupChooseFile: () => invoke("recovery:backup-choose-file"),
+  backupPreview: (file) => invoke("recovery:backup-preview", file),
+  backupRestore: (options) => invoke("recovery:backup-restore", options),
+  backupDelete: (file) => invoke("recovery:backup-delete", file),
+
   // --- lifecycle ---------------------------------------------------------
   launchTarget: (options) => invoke("recovery:launch", options),
   stopTarget: () => invoke("recovery:stop"),

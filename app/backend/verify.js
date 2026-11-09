@@ -237,6 +237,204 @@ function buildFixture(root) {
  * rules are exercised without touching the network, the real DSH home, or any
  * real submission.
  */
+/**
+ * 环境备份: export → inspect → restore into a second, empty home.
+ *
+ * The point of this feature is that it survives a *different machine*, so the
+ * restore half runs against a home that starts out empty rather than the one
+ * the bundle came from — restoring over the source would pass even if every
+ * path were hard-coded to it.
+ */
+async function verifyBackup(controller, fixture, result) {
+  const home = fixture.home;
+  const profileDir = path.join(home, "profiles", FIXTURE_PROFILE);
+
+  // A `link:` dependency is set up here rather than borrowed from the plugin
+  // tests, which remove theirs before this runs. The bundle has to carry the
+  // real path and git origin of a working copy, so this is asserted against a
+  // folder created for exactly that purpose.
+  const linkedTarget = path.join(fixture.work, "local-plugin-src");
+  ensureDir(linkedTarget);
+  writeJsonAtomic(path.join(linkedTarget, "package.json"), { name: "fake-backup-linked", version: "1.0.0" });
+  // A git config is INI, not JSON: `writeJsonAtomic` would serialise the string
+  // and the section header would no longer be found.
+  ensureDir(path.join(linkedTarget, ".git"));
+  fs.writeFileSync(path.join(linkedTarget, ".git", "config"), '[remote "origin"]\n\turl = https://example.invalid/fake-backup-linked.git\n');
+  fs.writeFileSync(path.join(linkedTarget, ".git", "HEAD"), "0123456789abcdef0123456789abcdef01234567\n");
+  const manifestPath = path.join(profileDir, "package.json");
+  const withLink = readJson(manifestPath);
+  withLink.value.dependencies = { ...withLink.value.dependencies, "fake-backup-linked": `link:${linkedTarget}` };
+  writeJsonAtomic(manifestPath, withLink.value);
+  await controller.dispatch("recovery:refresh", []);
+
+  result.ok(
+    "环境备份: 面板能看到要打包的内容",
+    controller.state.environmentBackup?.available === true &&
+      controller.state.environmentBackup.plan.registryPlugins.length >= 1,
+    controller.state.environmentBackup?.reason,
+  );
+
+  const exported = await controller.dispatch("recovery:backup-export", [{ includeSecrets: false }]);
+  const file = exported.result?.backup?.file;
+  result.ok(
+    "环境备份: 导出成为一个可读的文件",
+    exported.ok === true && isFile(file ?? "") && exported.result.backup.bytes > 0,
+    errorText(exported) ?? exported.result?.backup?.sizeLabel,
+  );
+  result.ok(
+    "环境备份: 默认不含凭据",
+    exported.result?.backup?.includesSecrets === false,
+    String(exported.result?.backup?.includesSecrets),
+  );
+
+  // The archive must describe itself: a bundle that unpacks to opaque bytes is
+  // useless for a user who wants to check what they are about to restore.
+  let peeked;
+  try {
+    peeked = require("./backup").peekBackup(file);
+  } catch (error) {
+    result.ok("环境备份: 包内含可读的 manifest.json", false, error instanceof Error ? error.message : String(error));
+    return;
+  }
+  const manifest = peeked.manifest;
+  result.ok(
+    "环境备份: manifest 记录了插件与技能",
+    manifest.format === "dsh-environment-backup" && manifest.registryPlugins.length >= 1 && Array.isArray(manifest.skills),
+    `${manifest.registryPlugins.length} 个联网插件 / ${manifest.skills.length} 个技能`,
+  );
+  const localRow = (manifest.localPlugins ?? []).find((plugin) => plugin.name === "fake-backup-linked");
+  result.ok(
+    "环境备份: 本地插件记录了路径与 git remote",
+    localRow !== undefined && localRow.path === linkedTarget && localRow.remote === "https://example.invalid/fake-backup-linked.git" && localRow.commit === "0123456789abcdef0123456789abcdef01234567",
+    localRow === undefined ? "本地插件没有进清单" : JSON.stringify({ path: localRow.path, remote: localRow.remote, commit: localRow.commit }),
+  );
+  result.ok(
+    "环境备份: 明确列出未进包的内容",
+    Array.isArray(manifest.excluded) && manifest.excluded.some((entry) => String(entry.match).includes("node_modules")),
+    `${manifest.excluded?.length ?? 0} 条`,
+  );
+
+  // Preview must describe the target home, and must not write anything.
+  const before = fs.readFileSync(path.join(profileDir, "package.json"), "utf8");
+  const preview = await controller.dispatch("recovery:backup-preview", [file]);
+  result.ok(
+    "环境备份: 预览统计新增/覆盖/相同",
+    preview.ok === true && Number.isFinite(preview.result?.restore?.counts?.same),
+    errorText(preview) ?? JSON.stringify(preview.result?.restore?.counts),
+  );
+  result.ok(
+    "环境备份: 预览后源文件未被改动",
+    fs.readFileSync(path.join(profileDir, "package.json"), "utf8") === before,
+  );
+
+  // Restore into an empty home: the real "new machine" case.
+  const target = path.join(fixture.work, "restored-home");
+  const agentsBase = path.join(fixture.work, "restored-agents");
+  const plan = require("./backup").planRestore(target, file, { profileName: FIXTURE_PROFILE, agentsBase });
+  result.ok(
+    "环境备份: 空目录恢复计划全部为新增",
+    plan.counts.create > 0 && plan.counts.overwrite === 0,
+    JSON.stringify(plan.counts),
+  );
+  const applied = require("./backup").applyRestore(plan, { home: target });
+  const restoredManifest = path.join(target, "profiles", FIXTURE_PROFILE, "package.json");
+  result.ok(
+    "环境备份: 恢复到空目录后 Profile 清单可解析",
+    applied.written.length > 0 && readJson(restoredManifest).ok === true,
+    `${applied.written.length} 个文件`,
+  );
+  result.ok(
+    "环境备份: 恢复出的清单与打包时逐字节一致",
+    fs.readFileSync(restoredManifest).equals(fs.readFileSync(path.join(profileDir, "package.json"))),
+  );
+  result.ok(
+    "环境备份: 恢复出的插件层条目与原来一致",
+    JSON.stringify(readJson(restoredManifest).value?.dsh?.profile?.bundles) === JSON.stringify(readJson(path.join(profileDir, "package.json")).value?.dsh?.profile?.bundles),
+  );
+
+  // A skill restore must land inside one of the configured roots, never in the
+  // real home: `agentsBase` above is the point of this check.
+  const skillTargets = applied.written.filter((entry) => entry.group === "skill").map((entry) => entry.target);
+  const skillRoots = [path.join(target, "skills"), path.join(agentsBase, "skills")];
+  result.ok(
+    "环境备份: 技能只写进指定的根目录",
+    skillTargets.every((skillTarget) => skillRoots.some((root) => skillTarget.startsWith(root))),
+    skillTargets.join(", ") || "本机 fixture 没有技能",
+  );
+
+  // Tampering: a bundle whose bytes no longer match its manifest must be refused
+  // rather than written, or a corrupted download would silently win.
+  const tampered = path.join(fixture.work, "tampered.zip");
+  const bytes = fs.readFileSync(file);
+  const at = bytes.indexOf(Buffer.from("dsh-profile-"));
+  if (at > 0) {
+    bytes.write("XXXXX", at + 11, "utf8");
+    fs.writeFileSync(tampered, bytes);
+    const badPlan = require("./backup").planRestore(target, tampered, { profileName: FIXTURE_PROFILE, agentsBase });
+    result.ok(
+      "环境备份: 内容与清单哈希不符的文件被跳过",
+      badPlan.warnings.some((warning) => warning.includes("哈希")),
+      badPlan.warnings.join(" | "),
+    );
+  } else {
+    result.ok("环境备份: 内容与清单哈希不符的文件被跳过", false, "找不到可篡改的位置（fixture 结构变了）");
+  }
+
+  // A bundle is user-supplied input, so it is hostile input. Three shapes are
+  // refused; each is asserted because "the restore wrote somewhere it should
+  // not have" is unrecoverable after the fact.
+  const hostile = path.join(fixture.work, "hostile.zip");
+  fs.writeFileSync(
+    hostile,
+    require("./zip").createZip([
+      {
+        name: "manifest.json",
+        data: JSON.stringify({
+          format: "dsh-environment-backup",
+          version: 1,
+          createdAt: new Date().toISOString(),
+          source: { profileName: FIXTURE_PROFILE, home: "elsewhere" },
+          includesSecrets: false,
+          registryPlugins: [],
+          localPlugins: [],
+          skills: [],
+          files: [
+            { group: "profile", source: "escape", entry: "files/home/../../../../escaped.txt" },
+            { group: "profile", source: "nm", entry: "files/home/profiles/demo/node_modules/injected.js" },
+            { group: "secret", source: "cred", entry: "files/home/.credentials.yaml" },
+          ],
+          excluded: [],
+          notes: [],
+        }),
+      },
+      { name: "files/home/../../../../escaped.txt", data: "x" },
+      { name: "files/home/profiles/demo/node_modules/injected.js", data: "x" },
+      { name: "files/home/.credentials.yaml", data: "x" },
+    ]),
+  );
+  const hostileHome = path.join(fixture.work, "hostile-home");
+  const hostilePlan = require("./backup").planRestore(hostileHome, hostile, { profileName: FIXTURE_PROFILE, agentsBase: agentsBase });
+  require("./backup").applyRestore(hostilePlan, { home: hostileHome });
+  result.ok(
+    "环境备份: 拒绝写到数据目录之外",
+    hostilePlan.actions.length === 0 && !fs.existsSync(path.join(fixture.work, "escaped.txt")) && !fs.existsSync(path.join(fixture.work, "..", "escaped.txt")),
+    hostilePlan.warnings.join(" | "),
+  );
+  result.ok(
+    "环境备份: 拒绝写进 node_modules",
+    !fs.existsSync(path.join(hostileHome, "profiles", FIXTURE_PROFILE, "node_modules", "injected.js")),
+  );
+  result.ok(
+    "环境备份: 声明不含凭据的包不还原凭据",
+    !fs.existsSync(path.join(hostileHome, ".credentials.yaml")) &&
+      hostilePlan.warnings.some((warning) => warning.includes("凭据")),
+    hostilePlan.warnings.join(" | "),
+  );
+
+  const deleted = await controller.dispatch("recovery:backup-delete", [file]);
+  result.ok("环境备份: 可以删除自己生成的备份", deleted.ok === true && !isFile(file), errorText(deleted));
+}
+
 async function verifyAwesome(controller, fixture, result) {
   const check = (options) => controller.dispatch("recovery:awesome-check", [options]);
   const EN = "Verify plugin: adds one row to the settings page.";
@@ -1192,6 +1390,7 @@ async function runVerify({ version, targets }) {
     await verifyPluginUpdater(controller, fixture, result);
     await verifyUpdaterStall(controller, fixture, result);
     await verifyUpdaterOriginAndGithub(controller, fixture, result);
+    await verifyBackup(controller, fixture, result);
     await verifyAwesome(controller, fixture, result);
     await verifyCheckpoints(controller, fixture, result);
     await verifyTargets(controller, fixture, result);

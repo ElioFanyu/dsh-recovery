@@ -56,6 +56,15 @@ const TABS = [
     },
   },
   { id: "profiles", label: "切换 Profile", badge: (value) => value.home.profileNames.length },
+  {
+    id: "backup",
+    label: "环境备份",
+    badge: (value) => {
+      const state = value.environmentBackup;
+      if (state === undefined || state.available !== true) return state === undefined ? undefined : "!";
+      return state.files?.length === 0 ? undefined : state.files.length;
+    },
+  },
   { id: "data", label: "重置与数据管理" },
   { id: "diagnostics", label: "诊断" },
 ];
@@ -330,6 +339,53 @@ const ACTIONS = {
     await run("删除全部检查点", "deleteAllCheckpoints");
   },
   "export-diagnostics": () => run("正在生成诊断包", "exportDiagnostics"),
+
+  // --- 环境备份 ----------------------------------------------------------
+  "backup-export": async (arg) => {
+    const withSecrets = arg === "secrets";
+    const plan = state.environmentBackup?.plan;
+    const size = withSecrets ? plan?.withSecretsLabel : plan?.sizeLabel;
+    if (
+      !confirm(
+        `导出环境备份${withSecrets ? "（含凭据）" : ""}：\n\n` +
+          `· Profile「${state.selectedProfile}」的清单、补丁层与锁文件\n` +
+          (withSecrets
+            ? "· ⚠ 凭据：.credentials.yaml、WorkBuddy 令牌、华为云 accessKey、本地网关 Key\n  该文件等同于你的账号密码，不要上传到公开位置\n"
+            : "· 不含任何凭据，恢复后需要重新登录各账号\n") +
+          `· 技能目录（${plan?.skillCount ?? "?"} 个）与各插件自己的设置文件\n` +
+          (size === undefined ? "" : `· 预计约 ${size}\n`) +
+          "\nnode_modules、会话历史、回滚快照与缓存不在包内。确定继续吗？",
+      )
+    )
+      return;
+    await run("正在导出环境备份", "backupExport", { includeSecrets: withSecrets });
+  },
+  "backup-choose-file": () => run("选择备份文件", "backupChooseFile"),
+  "backup-preview": (arg) => run("正在读取备份", "backupPreview", arg),
+  "backup-restore": async (arg) => {
+    const file = arg ?? state.environmentBackup?.lastRestore?.file;
+    if (typeof file !== "string" || file === "") {
+      toast("请先预览要恢复的备份文件", "error");
+      return;
+    }
+    if (
+      !confirm(
+        `从这个备份恢复？\n\n${file}\n\n` +
+          "· 会先用备份里的内容覆盖当前的 Profile 清单、补丁层与各插件设置\n" +
+          "· 技能目录同名覆盖，新增的技能会被写入\n" +
+          "· 恢复前自动创建检查点，随时可以回滚\n" +
+          "· 之后会用 pnpm 重新安装联网插件（需要联网，可能几分钟）\n\n" +
+          "确定继续吗？",
+      )
+    )
+      return;
+    await run("正在恢复环境备份", "backupRestore", { file, localPlugins: true, reinstall: true });
+  },
+  "backup-delete": async (arg) => {
+    if (!confirm(`删除这个备份文件？\n\n${arg}\n\n此操作不可撤销。`)) return;
+    await run("删除备份", "backupDelete", arg);
+  },
+
   "restart-button-apply": async () => {
     if (
       !confirm(
@@ -634,6 +690,7 @@ function renderPanels() {
   host.append(panel("checkpoints", renderCheckpoints()));
   host.append(panel("restart", renderRestartButton()));
   host.append(panel("profiles", renderProfiles()));
+  host.append(panel("backup", renderBackup()));
   host.append(panel("data", renderData()));
   host.append(panel("diagnostics", renderDiagnostics()));
 }
@@ -1677,6 +1734,228 @@ function renderProfiles() {
       actions: [button("打开 Profile 根目录", "open-path", state.home.profilesDir), button("打开数据目录", "open-path", state.home.path)],
     }),
   ];
+}
+
+// --- panel: environment backup --------------------------------------------
+
+const BACKUP_GROUP_LABEL = {
+  profile: "Profile 与插件清单",
+  "plugin-state": "插件设置",
+  agent: "Agent 与专家",
+  workspace: "工作区",
+  secret: "凭据",
+};
+
+function backupsGrouped(files) {
+  const groups = new Map();
+  for (const file of files) {
+    const key = file.error === undefined ? "ok" : "broken";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(file);
+  }
+  return groups;
+}
+
+function renderBackup() {
+  const section = state.environmentBackup ?? { available: false, files: [], reason: "尚未读取" };
+  const plan = section.plan;
+  const running = state.running.isRunning;
+  const node = [];
+
+  if (section.available !== true) {
+    node.push(
+      hint(`无法读取备份清单：${section.reason ?? "未知原因"}`),
+      card({
+        title: "环境备份",
+        desc: "读取 DSH 数据目录失败。修复数据目录后刷新即可。",
+        body: metrics([
+          ["数据目录", state.home.path, true],
+          ["备份目录", section.dir ?? "—", true],
+        ]),
+        actions: [button("打开数据目录", "open-path", state.home.path), button("刷新状态", "refresh")],
+      }),
+    );
+    return node;
+  }
+
+  if (plan !== undefined) {
+    const groups = new Map();
+    for (const group of plan.groups) {
+      if (!groups.has(group.group)) groups.set(group.group, []);
+      groups.get(group.group).push(group);
+    }
+    const groupNodes = [...groups.entries()].map(([key, entries]) => {
+      const totalFiles = entries.reduce((sum, entry) => sum + entry.fileCount, 0);
+      const totalBytes = entries.reduce((sum, entry) => sum + entry.bytes, 0);
+      const secret = key === "secret";
+      return el("div", { class: "list" }, [
+        el("div", { class: "row row--muted" }, [
+          el("div", { class: "row__main" }, [
+            el("div", { class: "row__name", text: BACKUP_GROUP_LABEL[key] ?? key }),
+            el("div", { class: "row__sub", text: `${totalFiles} 个文件 · ${formatBytes(totalBytes)}` }),
+          ]),
+          el("div", { class: "row__side" }, [secret ? chip("敏感", "danger") : undefined, chip(`${entries.length} 项`, "mono")]),
+        ]),
+        ...entries.map((entry) => row(rowIncluded(entry))),
+      ]);
+    });
+    node.push(
+      hint(
+        "导出的是「配置」而不是运行产物：Profile 清单、补丁层（各插件的设置）、技能目录与各插件自己的设置文件。node_modules、会话历史、回滚快照、附件与缓存都不进包 —— 它们要么能用 pnpm 重新装出来，要么属于历史记录。",
+      ),
+      card({
+        icon: "🧳",
+        title: "打包这些内容",
+        desc: `共 ${plan.dependencies} 个依赖、${plan.bundles} 个启用的插件层、${plan.skillCount} 个技能；不含凭据时约 ${plan.sizeLabel}${plan.withSecretsLabel === undefined ? "" : `，含凭据约 ${plan.withSecretsLabel}`}。`,
+        tags: [chip(`${plan.registryPlugins.length} 个联网插件`, "ok"), chip(`${plan.localPlugins.length} 个本地插件`), chip(`${plan.skillCount} 个技能`)],
+        body: groupNodes,
+        actions: [
+          button("导出备份（不含凭据）", "backup-export", "no-secrets", { className: "btn--primary" }),
+          button("导出备份（含凭据）", "backup-export", "secrets", { className: "btn--danger" }),
+          button("打开备份目录", "open-path", section.dir),
+        ],
+      }),
+      plan.withSecretsLabel === undefined
+        ? undefined
+        : hint("「含凭据」会把 .credentials.yaml、WorkBuddy 登录令牌、华为云 accessKey 与本地网关 Key 一并写入：那个文件等同于你的账号密码，不要上传到公开位置或发给别人。"),
+    );
+
+    if (plan.localPlugins.length > 0) {
+      node.push(
+        card({
+          title: "本地插件（源码不在备份里）",
+          desc: "这些插件是 `link:` 指向的本机工作副本。备份只记路径与 git 提交；恢复时按 remote 重新 clone，没有 remote 的需要你自己把目录拷过去。",
+          body: el(
+            "div",
+            { class: "list" },
+            plan.localPlugins.map((plugin) =>
+              row({
+                name: plugin.name,
+                mono: true,
+                sub: plugin.cloneable ? `${plugin.path ?? "?"} · 可从 ${plugin.remote} 恢复${plugin.commit === undefined ? "" : ` @ ${plugin.commit}`}` : `${plugin.path ?? "路径未记录"} · 没有 git remote，恢复后需手动放置`,
+                side: [plugin.exists === true ? chip("目录在", "ok") : chip("目录缺失", "warn"), plugin.cloneable ? chip("可 clone", "ok") : chip("手动", "warn")],
+              }),
+            ),
+          ),
+        }),
+      );
+    }
+
+    if (plan.skillRoots.some((root) => root.skills.length > 0)) {
+      node.push(
+        card({
+          title: "技能",
+          desc: "每个技能目录整体打包（不止 SKILL.md，随附的脚本与资料一起走）。恢复时写回同名目录。",
+          body: el(
+            "div",
+            { class: "list" },
+            plan.skillRoots.flatMap((root) =>
+              root.skills.map((skill) =>
+                row({
+                  name: skill.displayName ?? skill.name,
+                  sub: joinSub(root.label, skill.name, skill.version === undefined ? undefined : `v${skill.version}`, `${skill.fileCount} 个文件 · ${skill.sizeLabel}`),
+                  side: [chip(skill.name, "mono")],
+                }),
+              ),
+            ),
+          ),
+        }),
+      );
+    }
+
+    if (plan.notes.length > 0 || plan.excluded.length > 0) {
+      node.push(
+        card({
+          title: "没有进包的内容",
+          desc: "备份会明确列出它没带什么，而不是让你以为都带上了。",
+          body: [
+            ...plan.notes.map((note) => hint(note)),
+            el(
+              "div",
+              { class: "list" },
+              plan.excluded.map((entry) => row({ name: entry.match, mono: true, sub: entry.reason, muted: true })),
+            ),
+          ],
+        }),
+      );
+    }
+  }
+
+  const files = section.files ?? [];
+  const latest = files[0];
+  node.push(
+    card({
+      icon: "📦",
+      title: "恢复",
+      desc:
+        files.length === 0
+          ? "还没有备份。先在上一张卡里导出一份，换电脑或重装后回到这里选择它恢复。"
+          : `备份目录 ${section.dir}，共 ${files.length} 份。恢复前会先创建检查点，可随时回滚；恢复只改配置文件，插件要重新安装。`,
+      tags: files.length === 0 ? undefined : [chip(`${files.length} 份`, "ok")],
+      body:
+        files.length === 0
+          ? undefined
+          : el(
+              "div",
+              { class: "list" },
+              files.map((file) =>
+                row({
+                  name: file.name,
+                  mono: true,
+                  sub: joinSub(
+                    file.timeLabel,
+                    file.sizeLabel,
+                    file.error === undefined ? undefined : `无法读取：${file.error}`,
+                    file.error === undefined ? `${file.pluginCount ?? "?"} 个插件 · ${file.skillCount ?? "?"} 个技能` : undefined,
+                    file.profileName === undefined ? undefined : `Profile ${file.profileName}`,
+                  ),
+                  side: [
+                    file.includesSecrets === true ? chip("含凭据", "danger") : chip("无凭据"),
+                    button("预览", "backup-preview", file.file),
+                    button("恢复", "backup-restore", file.file, { className: "btn--danger", disabled: running }),
+                    button("删除", "backup-delete", file.file, { className: "btn--ghost" }),
+                  ],
+                }),
+              ),
+            ),
+      actions: [button("从文件恢复…", "backup-choose-file", undefined, { className: "btn--primary", disabled: running })],
+    }),
+  );
+
+  if (running) {
+    node.push(hint("目标应用正在运行：导出仍然安全，但恢复会先要求你停止应用 —— 应用的退出流程会重写 Profile，覆盖恢复结果。"));
+  }
+
+  if (section.lastRestore !== undefined) {
+    node.push(
+      card({
+        title: "上次恢复的结果",
+        desc: section.lastRestore.message,
+        body: metrics([
+          ["来源备份", section.lastRestore.file, true],
+          ["写入文件", String(section.lastRestore.written ?? 0)],
+          ["恢复前检查点", section.lastRestore.checkpointId ?? "—", true],
+          ["联网插件", section.lastRestore.install === undefined ? "未执行" : section.lastRestore.install.ok === true ? "已重新安装" : "未装完"],
+        ]),
+        actions: [section.lastRestore.checkpointId === undefined ? undefined : button("回滚到恢复前", "restore-checkpoint", section.lastRestore.checkpointId, { className: "btn--ghost" })],
+      }),
+    );
+  }
+
+  return node;
+}
+
+function rowIncluded(group) {
+  const label = group.included === false ? `${group.label}（未勾选）` : group.label;
+  return {
+    name: label,
+    sub: group.desc,
+    muted: group.included === false,
+    side: [
+      group.secrets === true ? chip("凭据", "danger") : undefined,
+      group.fileCount === 0 ? chip("本机没有") : chip(`${group.fileCount} 个 · ${group.sizeLabel}`, "mono"),
+    ],
+  };
 }
 
 // --- panel: data ----------------------------------------------------------

@@ -5,6 +5,9 @@
 .safemode/
 diagnostics/
 
+# 环境备份：本机配置（可能含凭据）的打包产物，绝不能进版本库
+backups/
+
 # 按机器生成的配置与「按目标归档」布局的状态文件
 dsh-recovery.config.json
 state-*.json

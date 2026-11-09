@@ -9,11 +9,12 @@
 //     are also individually reversible);
 //   * the renderer can only ask the shell to open paths inside known roots.
 
+const fs = require("node:fs");
 const path = require("node:path");
 
 const { app, dialog, shell } = require("electron");
 
-const { formatBytes, formatLocalTime, isDirectory, pathExists } = require("./util");
+const { formatBytes, formatLocalTime, isDirectory, isFile, pathExists } = require("./util");
 const paths = require("./paths");
 const profile = require("./profile");
 const checkpoints = require("./checkpoints");
@@ -22,6 +23,7 @@ const diagnostics = require("./diagnostics");
 const restartButton = require("./restart-button");
 const updater = require("./plugin-updater");
 const awesome = require("./awesome");
+const backup = require("./backup");
 
 function isWithin(parent, child) {
   const relative = path.relative(parent, child);
@@ -46,6 +48,12 @@ class RecoveryController {
     // Last 收录插件 check result. Kept in memory only: it can be large (every
     // finding plus the generated YAML) and is cheap to recompute.
     this.awesome = undefined;
+    // Last backup preview. Kept so the panel can show what a confirm would do
+    // without re-reading a multi-megabyte archive; `restoreBackup` recomputes
+    // anyway, so a stale copy can never cause a wrong write.
+    this.pendingRestore = undefined;
+    // Outcome of the last restore, for the panel's summary card.
+    this.lastRestore = undefined;
   }
 
   // -- persistence ---------------------------------------------------------
@@ -159,6 +167,9 @@ class RecoveryController {
       // section is pure data about the configured directories plus the last
       // check. `gather()` must not fail because of it.
       awesome: this.summarizeAwesome(),
+      // 环境备份: what a bundle would contain right now, plus the ones already
+      // written. Read-only; every export/restore is a channel below.
+      environmentBackup: this.summarizeBackup(home),
       lastAction: this.lastAction,
       busy: this.busy,
     };
@@ -254,6 +265,102 @@ class RecoveryController {
       newFileUrl: awesome.NEW_FILE_URL,
       lastCheck: this.awesome,
     };
+  }
+
+  // -- 环境备份 -----------------------------------------------------------
+
+  /**
+   * What a bundle would contain right now.
+   *
+   * Read-only and never fatal: a home with a broken manifest is exactly the
+   * home worth backing up, so a read error becomes data. `includeSecrets` is
+   * honoured here only to show the size difference — the flag that actually
+   * writes credentials is passed to `backup-export`.
+   */
+  summarizeBackup(home) {
+    const profileName = typeof this.selectedProfile === "string" && this.selectedProfile !== "" ? this.selectedProfile : "desktop";
+    const withSecrets = () => {
+      try {
+        return backup.collect(home, { profileName, includeSecrets: true, agentsBase: this.agentsBase() });
+      } catch (error) {
+        return undefined;
+      }
+    };
+    try {
+      const plain = backup.collect(home, { profileName, includeSecrets: false, agentsBase: this.agentsBase() });
+      const full = withSecrets();
+      return {
+        available: true,
+        profileName,
+        dir: backup.backupsDir(),
+        lastRestore: this.lastRestore,
+        files: backup.listBackups().map((entry) => ({
+          ...entry,
+          sizeLabel: formatBytes(entry.bytes),
+          timeLabel: entry.modifiedAt === undefined ? undefined : formatLocalTime(entry.modifiedAt),
+        })),
+        plan: {
+          groups: plain.groups.map((group) => ({
+            key: group.key,
+            group: group.group,
+            label: group.label,
+            desc: group.desc,
+            secrets: group.secrets,
+            included: group.included !== false,
+            fileCount: group.files.length,
+            bytes: group.bytes,
+            sizeLabel: formatBytes(group.bytes),
+          })),
+          registryPlugins: plain.registryPlugins.map((plugin) => ({ name: plugin.name, spec: plugin.spec })),
+          localPlugins: plain.localPlugins.map((plugin) => ({
+            name: plugin.name,
+            spec: plugin.spec,
+            path: plugin.path,
+            exists: plugin.exists === true,
+            cloneable: typeof plugin.remote === "string" && plugin.remote !== "",
+            remote: plugin.remote,
+            commit: typeof plugin.commit === "string" ? plugin.commit.slice(0, 12) : undefined,
+          })),
+          skillRoots: plain.skillRoots.map((root) => ({
+            key: root.key,
+            label: root.label,
+            dir: root.dir,
+            exists: root.exists,
+            skills: root.skills.map((skill) => ({
+              name: skill.name,
+              displayName: skill.displayName,
+              version: skill.version,
+              summary: skill.summary,
+              fileCount: skill.fileCount,
+              sizeLabel: formatBytes(skill.bytes),
+            })),
+          })),
+          skillCount: plain.skillCount,
+          dependencies: plain.dependencies,
+          bundles: plain.bundles,
+          bytes: plain.bytes,
+          sizeLabel: formatBytes(plain.bytes),
+          withSecretsBytes: full === undefined ? undefined : full.bytes,
+          withSecretsLabel: full === undefined ? undefined : formatBytes(full.bytes),
+          excluded: plain.excluded,
+          notes: plain.unsupported,
+        },
+      };
+    } catch (error) {
+      return { available: false, reason: describeError(error), dir: backup.backupsDir(), profileName, files: [] };
+    }
+  }
+
+  /** `~/.agents` — shared with other agent tools, so it is never the DSH home. */
+  agentsBase() {
+    return path.join(require("node:os").homedir(), ".agents");
+  }
+
+  /** A backup file the user picked, validated as one of ours before it is trusted. */
+  requireBackupFile(file) {
+    const resolved = path.resolve(String(file));
+    if (!isFile(resolved)) throw new Error(`备份文件不存在: ${resolved}`);
+    return resolved;
   }
 
   requireUpdaterPnpm() {
@@ -453,6 +560,51 @@ class RecoveryController {
       }
       case "recovery:show-item":
         return this.showItem(String(args[0] ?? ""));
+
+      // -- 环境备份 ---------------------------------------------------------
+      //
+      // Export runs while the app is running: it only reads the home and writes
+      // a new file, so there is nothing to corrupt. Restore is the opposite —
+      // it rewrites the Profile the running app holds in memory and will
+      // overwrite on exit — so it goes through `perform` and `requireIdle`.
+      case "recovery:backup-export": {
+        const options = args[0] !== null && typeof args[0] === "object" ? args[0] : {};
+        return this.exportBackup(options);
+      }
+
+      case "recovery:backup-choose-file": {
+        const picked = await dialog.showOpenDialog({
+          title: "选择要恢复的 DSH 环境备份",
+          defaultPath: backup.backupsDir(),
+          properties: ["openFile"],
+          filters: [{ name: "环境备份", extensions: ["zip"] }],
+        });
+        if (picked.canceled === true || picked.filePaths.length === 0) return { ok: false, canceled: true, state: this.state };
+        return this.dispatch("recovery:backup-preview", [picked.filePaths[0]]);
+      }
+
+      case "recovery:backup-preview":
+        return this.previewBackup(String(args[0] ?? ""));
+
+      case "recovery:backup-restore":
+        return this.restoreBackup(args[0] ?? {});
+
+      case "recovery:backup-delete": {
+        const file = String(args[0] ?? "");
+        if (file === "") return { ok: false, error: "缺少要删除的备份文件", state: this.state };
+        // Only files this console produced are deletable from here.
+        const resolved = path.resolve(file);
+        if (path.dirname(resolved).toLowerCase() !== path.resolve(backup.backupsDir()).toLowerCase()) {
+          return { ok: false, error: `只能删除备份目录里的文件: ${resolved}`, state: this.state };
+        }
+        try {
+          fs.rmSync(resolved, { force: true });
+        } catch (error) {
+          return { ok: false, error: describeError(error), state: this.state };
+        }
+        this.record(true, `已删除备份 ${path.basename(resolved)}`);
+        return { ok: true, result: { message: `已删除 ${path.basename(resolved)}` }, state: await this.refresh({ sizes: false }) };
+      }
 
       case "recovery:checkpoints":
         return { checkpoints: this.state.checkpoints };
@@ -749,6 +901,185 @@ class RecoveryController {
     this.persist({ targetId: id });
     this.record(true, `已切换目标应用: ${found.label ?? id}`);
     return { ok: true, state: await this.refresh({ sizes: false }) };
+  }
+
+  /**
+   * Write a backup bundle.
+   *
+   * Deliberately NOT behind `requireIdle`: the bundle is read from the home and
+   * written to the console's own directory, so a running app cannot interfere
+   * with it. Requiring a stop here would have made "跑一次备份" the one action
+   * that forces the user to quit DSH.
+   */
+  async exportBackup(options = {}) {
+    const home = this.state?.home?.path ?? paths.resolveDshHomeInfo(this.config.dshHome).path;
+    const includeSecrets = options.includeSecrets === true;
+    const profileName = typeof this.selectedProfile === "string" && this.selectedProfile !== "" ? this.selectedProfile : "desktop";
+    return this.perform(
+      "导出环境备份",
+      async () => {
+        const outcome = backup.exportBackup(home, {
+          profileName,
+          includeSecrets,
+          consoleVersion: this.version,
+          dshVersion: this.state?.selected?.appVersion,
+        });
+        const summary = outcome.manifest;
+        return {
+          message:
+            `已导出备份 ${path.basename(outcome.file)}（${formatBytes(outcome.bytes)}）· ` +
+            `${summary.registryPlugins.length} 个联网插件、${summary.localPlugins.length} 个本地插件、${summary.skills.length} 个技能` +
+            (includeSecrets ? " · 含凭据" : ""),
+          backup: {
+            file: outcome.file,
+            bytes: outcome.bytes,
+            sizeLabel: formatBytes(outcome.bytes),
+            includesSecrets: includeSecrets,
+            registryPlugins: summary.registryPlugins.length,
+            localPlugins: summary.localPlugins.length,
+            skills: summary.skills.length,
+            files: summary.files.filter((row) => typeof row.entry === "string").length,
+          },
+        };
+      },
+      { sizes: false },
+    );
+  }
+
+  /** Read a bundle and say exactly what restoring it would change. Writes nothing. */
+  previewBackup(file) {
+    if (file === "") return { ok: false, error: "缺少备份文件路径", state: this.state };
+    try {
+      const resolved = this.requireBackupFile(file);
+      const home = this.state?.home?.path ?? paths.resolveDshHomeInfo(this.config.dshHome).path;
+      const profileName = typeof this.selectedProfile === "string" && this.selectedProfile !== "" ? this.selectedProfile : "desktop";
+      const plan = backup.planRestore(home, resolved, { profileName, agentsBase: this.agentsBase() });
+      this.pendingRestore = plan;
+      return {
+        ok: true,
+        result: {
+          message: `备份 ${path.basename(resolved)}：${plan.counts.create} 个新增、${plan.counts.overwrite} 个覆盖、${plan.counts.same} 个相同、${plan.counts.skills} 个技能`,
+          restore: this.describePlan(plan),
+        },
+        state: this.state,
+      };
+    } catch (error) {
+      this.pendingRestore = undefined;
+      return { ok: false, error: describeError(error), state: this.state };
+    }
+  }
+
+  /**
+   * Apply a previously previewed restore.
+   *
+   * The plan is recomputed from the file rather than trusting the renderer's
+   * copy: between preview and confirm the user may have switched profile, and a
+   * stale target list would then write into the wrong place.
+   */
+  async restoreBackup(options = {}) {
+    const file = String(options.file ?? "");
+    if (file === "") return { ok: false, error: "缺少备份文件路径", state: this.state };
+    const includeLocalPlugins = options.localPlugins === true;
+    const reinstall = options.reinstall !== false;
+    const profileName = typeof this.selectedProfile === "string" && this.selectedProfile !== "" ? this.selectedProfile : "desktop";
+    const home = this.state?.home?.path ?? paths.resolveDshHomeInfo(this.config.dshHome).path;
+
+    let plan;
+    try {
+      plan = backup.planRestore(home, this.requireBackupFile(file), { profileName, agentsBase: this.agentsBase() });
+    } catch (error) {
+      return { ok: false, error: describeError(error), state: this.state };
+    }
+
+    return this.perform(
+      "恢复环境备份",
+      async () => {
+        this.requireIdle();
+        const checkout = await this.autoCheckpoint(`恢复备份 ${path.basename(file)} 之前`);
+
+        // Local plugin sources first: the profile manifest written below points
+        // at them, and a dangling `link:` makes pnpm install fail outright.
+        const localResults = includeLocalPlugins ? backup.restoreLocalPlugins(plan.localPlugins, { clone: true }) : [];
+        const applied = backup.applyRestore(plan, { home });
+
+        // Registry plugins come back through pnpm, using the restored manifest
+        // as the source of truth. A failure here is reported, not swallowed:
+        // the config is already written, so the user can simply retry.
+        let install;
+        if (reinstall && plan.registryPlugins.length > 0) {
+          const profileDir = path.join(home, "profiles", profileName);
+          const installDir = updater.installDirOf(this.state?.selected);
+          if (updater.resolvePnpm(installDir) === undefined) {
+            install = { ok: false, error: "找不到可用的 pnpm，插件没有自动安装；配置文件已恢复，可在「插件更新」页手动安装。" };
+          } else {
+            try {
+              const run = await updater.__runPnpm(profileDir, updater.resolvePnpm(installDir), ["install", "--config.minimum-release-age=0", "--ignore-scripts", "--config.side-effects-cache=false"]);
+              install = { ok: run.status === 0, status: run.status, output: run.output.slice(-4000) };
+            } catch (error) {
+              install = { ok: false, error: describeError(error) };
+            }
+          }
+        }
+
+        const lines = [];
+        lines.push(`已写入 ${applied.written.length} 项、跳过 ${applied.skipped.length} 项`);
+        if (localResults.length > 0) {
+          const cloned = localResults.filter((entry) => entry.state === "cloned").length;
+          const present = localResults.filter((entry) => entry.state === "present").length;
+          const manual = localResults.filter((entry) => entry.state === "manual" || entry.state === "failed").length;
+          lines.push(`本地插件：${present} 个已在位、${cloned} 个已 clone${manual === 0 ? "" : `、${manual} 个需要手动处理`}`);
+        }
+        if (install !== undefined) lines.push(install.ok ? "联网插件已重新安装" : `联网插件未装完：${install.error ?? `pnpm 退出码 ${install.status}`}`);
+        this.lastRestore = {
+          file,
+          message: lines.join(" · "),
+          checkpointId: checkout.id,
+          written: applied.written.length,
+          install,
+          at: new Date().toISOString(),
+        };
+        return {
+          message: lines.join(" · "),
+          restore: {
+            ...this.describePlan(plan),
+            checkpointId: checkout.id,
+            written: applied.written.length,
+            skippedFiles: applied.skipped,
+            localPlugins: localResults,
+            install,
+          },
+        };
+      },
+      { sizes: false },
+    );
+  }
+
+  /** Renderer-facing shape of a restore plan (no buffers, no absolute-entry noise). */
+  describePlan(plan) {
+    return {
+      file: plan.file,
+      profileName: plan.profileName,
+      createdAt: plan.manifest.createdAt,
+      source: plan.manifest.source,
+      includesSecrets: plan.includesSecrets,
+      counts: plan.counts,
+      warnings: plan.warnings,
+      notes: plan.notes,
+      excluded: plan.excluded,
+      registryPlugins: plan.registryPlugins,
+      localPlugins: plan.localPlugins.map((plugin) => ({
+        name: plugin.name,
+        path: plugin.path,
+        present: plugin.present === true,
+        cloneable: plugin.cloneable === true,
+        remote: plugin.remote,
+        commit: typeof plugin.commit === "string" ? plugin.commit.slice(0, 12) : undefined,
+      })),
+      skills: plan.manifest.skills ?? [],
+      actions: plan.actions
+        .filter((action) => action.kind === "file")
+        .map((action) => ({ target: action.target, state: action.state, bytes: action.bytes, group: action.group })),
+    };
   }
 
   /**
