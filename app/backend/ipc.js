@@ -747,13 +747,6 @@ class RecoveryController {
         });
       }
 
-      case "recovery:plugin-remove": {
-        const name = String(args[0] ?? "").trim();
-        if (name === "") return { ok: false, error: "缺少要卸载的插件名", state: this.state };
-        return this.runUpdater(`卸载 ${name}`, `卸载 ${name}`, (dir, installDir) =>
-          updater.remove(dir, name, { installDir }), { needsPnpm: true });
-      }
-
       case "recovery:plugin-check": {
         const name = String(args[0] ?? "").trim();
         const outcome = updater.check(this.requireUpdaterDir(), name, {

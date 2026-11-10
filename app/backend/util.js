@@ -4,7 +4,6 @@
 // target profile's node_modules is broken.
 
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 
 function pathExists(target) {
@@ -103,13 +102,6 @@ function formatLocalTime(iso) {
   );
 }
 
-function timestampSuffix(date = new Date()) {
-  return (
-    `${date.getFullYear()}-${two(date.getMonth() + 1)}-${two(date.getDate())}T` +
-    `${two(date.getHours())}-${two(date.getMinutes())}-${two(date.getSeconds())}-${String(date.getMilliseconds()).padStart(3, "0")}`
-  );
-}
-
 function fileSizeOrZero(target) {
   try {
     return fs.statSync(target).size;
@@ -194,10 +186,6 @@ function copyFileIfPresent(source, destination) {
   return true;
 }
 
-function homeDisplay(resolvedHome) {
-  return resolvedHome === path.join(os.homedir(), ".dsh") ? "~/.dsh" : "$DSH_HOME";
-}
-
 module.exports = {
   copyFileIfPresent,
   directorySize,
@@ -205,7 +193,6 @@ module.exports = {
   fileSizeOrZero,
   formatBytes,
   formatLocalTime,
-  homeDisplay,
   isDirectory,
   isFile,
   lstatOrUndefined,
@@ -213,7 +200,6 @@ module.exports = {
   readJson,
   removeEntry,
   timestampId,
-  timestampSuffix,
   uniquePath,
   writeFileAtomic,
   writeJsonAtomic,

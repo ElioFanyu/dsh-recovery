@@ -62,7 +62,6 @@ const CHANNELS = [
   "recovery:plugin-install",
   "recovery:plugin-install-market",
   "recovery:plugin-update",
-  "recovery:plugin-remove",
   "recovery:plugin-check",
   "recovery:open-external",
   "recovery:awesome-choose-dir",
@@ -153,17 +152,18 @@ async function runUiCheck({ shot }) {
   if (typeof before.error === "string") {
     throw new Error(`渲染失败：${before.error}；控制台：${JSON.stringify(consoleMessages.slice(-8))}`);
   }
-  // Nine panels. 插件管理 and 插件更新 were merged into one tab: both rendered
-  // the same package list from two different backends (`profile.listPlugins`
-  // and `plugin-updater.inspectProfile`) under two sets of field names, so the
-  // reader had to translate between two views of one thing.
-  if (before.tabs.length !== 9) issues.push(`页签数量为 ${before.tabs.length}，期望 9`);
+  // Eight panels. 插件管理 和 插件更新 were merged (both rendered the same
+  // package list from two backends), and 切换 Profile went into 数据与 Profile
+  // (a profile is a subdirectory of the data directory).
+  if (before.tabs.length !== 8) issues.push(`页签数量为 ${before.tabs.length}，期望 8`);
   if (!before.tabs.some((label) => label.includes("重启按钮"))) issues.push("页签中没有「重启按钮」");
   if (!before.tabs.some((label) => label.includes("插件管理"))) issues.push("页签中没有「插件管理」");
   if (before.tabs.some((label) => label.includes("插件更新"))) issues.push("页签中仍有独立的「插件更新」（应已并入「插件管理」）");
+  if (before.tabs.some((label) => label.includes("切换 Profile"))) issues.push("页签中仍有独立的「切换 Profile」（应已并入「数据与 Profile」）");
   if (!before.tabs.some((label) => label.includes("收录插件"))) issues.push("页签中没有「收录插件」");
   if (!before.tabs.some((label) => label.includes("环境备份"))) issues.push("页签中没有「环境备份」");
-  if (before.panelCount !== 9) issues.push(`面板数量为 ${before.panelCount}，期望 9`);
+  if (!before.tabs.some((label) => label.includes("Profile"))) issues.push("页签中没有承载 Profile 切换的「数据与 Profile」");
+  if (before.panelCount !== 8) issues.push(`面板数量为 ${before.panelCount}，期望 8`);
   for (const method of [
     "restartButtonApply",
     "restartButtonRevert",
@@ -390,6 +390,33 @@ async function runUiCheck({ shot }) {
     if (!awesomePanel.text.includes("收录到 awesome-dsh-plugin")) issues.push("收录插件面板缺少主卡片");
   }
 
+  // The tab that absorbed 切换 Profile must actually offer a profile row to
+  // select, plus the data-directory controls it always had. A merged tab that
+  // silently dropped the profile list would look fine to the compiler.
+  const dataPanel = await win.webContents.executeJavaScript(`${panelProbe}("data")`);
+  if (dataPanel === null) issues.push("找不到「数据与 Profile」面板");
+  else {
+    for (const action of ["choose-home", "reset-home", "reset-data"]) {
+      if (!dataPanel.actions.some((button) => button.action === action)) issues.push(`数据与 Profile 面板缺少按钮 ${action}`);
+    }
+    if (!dataPanel.text.includes("选择 Profile") && !dataPanel.text.includes("Profile 根目录")) {
+      issues.push("数据与 Profile 面板没有 Profile 相关区域");
+    }
+    // Every non-current profile row must have a working 选择 button; a tab that
+    // rendered the list but no way to switch would look fine to the compiler.
+    // Built with a quote-free selector so the nested quoting cannot drift.
+    const profileProbe =
+      "(() => { const n = document.querySelector('.panel[data-panel=' + JSON.stringify('data') + ']'); " +
+      "if (n === null) return null; " +
+      "return { chooses: n.querySelectorAll('button[data-action=' + JSON.stringify('select-profile') + ']').length, " +
+      "current: (n.innerText.match(/当前 Profile/g) ?? []).length }; })()";
+    const profileRows = await win.webContents.executeJavaScript(profileProbe);
+    if (profileRows === null) issues.push("无法读取「数据与 Profile」面板的 Profile 行");
+    else if (profileRows.chooses + profileRows.current === 0) {
+      issues.push("数据与 Profile 面板没有任何 Profile 行（既没有「选择」也没有「当前 Profile」）");
+    }
+  }
+
   // Pointing the console at an install that auto-detection missed must be
   // reachable from the diagnostics panel even when only one install is known.
   const diagnosticsPanel = await win.webContents.executeJavaScript(`${panelProbe}("diagnostics")`);
@@ -406,7 +433,7 @@ async function runUiCheck({ shot }) {
   // Capture each panel that gained a one-click button (plus the overview
   // panel), so a ui-check run also leaves visual evidence for those screens.
   const extraShots = {};
-  for (const [panelId, suffix] of [["quick", "quick"], ["plugins", "plugins"], ["awesome", "awesome"], ["checkpoints", "checkpoints"], ["backup", "backup"], ["diagnostics", "diagnostics"]]) {
+  for (const [panelId, suffix] of [["quick", "quick"], ["plugins", "plugins"], ["awesome", "awesome"], ["checkpoints", "checkpoints"], ["backup", "backup"], ["data", "data"], ["diagnostics", "diagnostics"]]) {
     await win.webContents.executeJavaScript(`document.querySelector('[data-action="tab"][data-arg="${panelId}"]').click()`);
     await sleep(400);
     const file = shot.replace(/\.png$/i, `-${suffix}.png`);

@@ -29,7 +29,11 @@ const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 const https = require("node:https");
 
-const CORE_BUNDLES = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"];
+// The packages that ship inside the application. `profile.js` owns this list
+// (it is the module that classifies plugins); importing it here instead of
+// keeping a second copy is what keeps "is this a core bundle?" from having two
+// answers that can drift apart.
+const { CORE_BUNDLES } = require("./profile");
 const SPEC_PATTERN = /^[A-Za-z0-9@:./_#+~^=-]+$/;
 
 // The market the console itself is able to install. `dsh-market` is the older
@@ -1115,36 +1119,6 @@ async function update(dir, spec, options = {}) {
   return { ok: verdict.ok, name, from: current, to: installed, lines: [...lines, ...verdict.lines], message: verdict.message };
 }
 
-async function remove(dir, name, options = {}) {
-  const { installDir, dryRun } = options;
-  const lines = [];
-  const manifest = readJson(profileManifestPath(dir));
-  if (manifest.dependencies?.[name] === undefined) throw new Error(`${name} 没有在 package.json 里声明`);
-
-  // Drop the bundle layer FIRST. Left behind, the next boot composes a layer
-  // whose package is gone — on Desktop the window then never opens.
-  const bundles = bundleList(manifest);
-  if (bundles.includes(name)) {
-    if (dryRun === true) lines.push({ level: "info", text: "将先移除插件层条目" });
-    else {
-      setBundleList(manifest, bundles.filter((entry) => entry !== name));
-      writeJsonAtomic(profileManifestPath(dir), manifest);
-      lines.push({ level: "ok", text: "已移除插件层条目" });
-    }
-  }
-  if (dryRun === true) {
-    lines.push({ level: "info", text: `将执行: pnpm remove ${name}` });
-    return { ok: true, dryRun: true, name, lines, message: "预览完成" };
-  }
-  const run = await runPnpm(dir, requirePnpm(installDir), ["remove", name, ...pnpmFlags({})]);
-  if (run.status !== 0) throw new Error(`pnpm remove ${name} 失败（退出码 ${run.status}）\n${run.output.trim()}`);
-  if (installedManifest(dir, name) !== undefined) {
-    lines.push({ level: "warn", text: `${name} 仍在 node_modules 里（可能有进程占用着它的文件）` });
-  }
-  lines.push({ level: "ok", text: `已卸载 ${name}` });
-  return { ok: true, name, lines, message: `已卸载 ${name}` };
-}
-
 function check(dir, name, options = {}) {
   const manifest = readJson(profileManifestPath(dir));
   const onDisk = installedManifest(dir, name);
@@ -1222,7 +1196,6 @@ module.exports = {
   pidAlive,
   profileDirOf,
   registryNameOf,
-  remove,
   repair,
   resolvePnpm,
   staleArtifacts,

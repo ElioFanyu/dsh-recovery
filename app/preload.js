@@ -57,7 +57,6 @@ contextBridge.exposeInMainWorld("recovery", {
   pluginInstall: (spec, dryRun) => invoke("recovery:plugin-install", spec, dryRun === true),
   pluginInstallMarket: (dryRun) => invoke("recovery:plugin-install-market", dryRun === true),
   pluginUpdate: (spec, dryRun) => invoke("recovery:plugin-update", spec, dryRun === true),
-  pluginRemove: (name) => invoke("recovery:plugin-remove", name),
   pluginCheck: (name) => invoke("recovery:plugin-check", name),
 
   // --- 收录插件 (awesome-dsh-plugin submission) ---------------------------

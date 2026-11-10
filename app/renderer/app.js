@@ -61,7 +61,9 @@ const TABS = [
       return patch.entries?.some((entry) => entry.verdict === "unknown") ? "!" : undefined;
     },
   },
-  { id: "profiles", label: "切换 Profile", badge: (value) => value.home.profileNames.length },
+  // Profile switching lives in 重置与数据管理: a profile is a subdirectory of
+  // the data directory, and both tabs were answering "which directory / which
+  // profile am I working on".
   {
     id: "backup",
     label: "环境备份",
@@ -71,7 +73,7 @@ const TABS = [
       return state.files?.length === 0 ? undefined : state.files.length;
     },
   },
-  { id: "data", label: "重置与数据管理" },
+  { id: "data", label: "数据与 Profile" },
   { id: "diagnostics", label: "诊断" },
 ];
 
@@ -594,7 +596,6 @@ const ACTIONS = {
     return run("打开 GitHub", "openExternal", file === undefined ? base : `${base}?filename=${encodeURIComponent(file)}`);
   },
 
-  "set-target": (arg) => run("切换目标应用", "setTarget", arg),
   "choose-target": () => run("选择安装位置", "chooseTarget"),
   "choose-target-exe": () => run("选择应用主程序", "chooseTarget", "exe"),
   "forget-target": async (arg) => {
@@ -618,10 +619,6 @@ const SELECTS = {
 };
 
 // --- render ---------------------------------------------------------------
-
-function mustState() {
-  return state;
-}
 
 function render() {
   if (state === undefined) return;
@@ -698,7 +695,6 @@ function renderPanels() {
   host.append(panel("awesome", renderAwesome()));
   host.append(panel("checkpoints", renderCheckpoints()));
   host.append(panel("restart", renderRestartButton()));
-  host.append(panel("profiles", renderProfiles()));
   host.append(panel("backup", renderBackup()));
   host.append(panel("data", renderData()));
   host.append(panel("diagnostics", renderDiagnostics()));
@@ -753,18 +749,6 @@ function renderQuick() {
       desc: "把当前 Profile 的插件集恢复为 DSH 默认（dsh-base + dsh-web-app），并把 cordis.patch.yml 另存为 .bak 备份。已下载的包保留在磁盘上，可重新启用。",
       actions: [
         button("重置插件集", "sanitize-profile", undefined, { className: "btn--danger", disabled: running }),
-      ],
-    }),
-    card({
-      icon: "📂",
-      title: "打开位置",
-      desc: "直接查看恢复器会用到的目录与文件。",
-      actions: [
-        button("Profile 目录", "open-profile-dir"),
-        detail?.patchPath === undefined ? undefined : button("插件补丁", "open-path", detail.patchPath),
-        button("数据目录", "open-path", state.home.path),
-        button("检查点目录", "open-path", state.checkpointRoot),
-        button("恢复器配置", "open-path", state.config.file),
       ],
     }),
   ];
@@ -1626,7 +1610,6 @@ function renderCheckpoints() {
               : `永久删除全部 ${state.checkpoints.length} 个检查点`,
         }),
         button("在文件夹中显示", "open-path", state.checkpointRoot),
-        button("生成诊断包", "export-diagnostics", undefined, { className: "btn--ghost" }),
       ],
     ),
     hint("检查点只保存 Profile 的配置文件（package.json、cordis.patch.yml、cordis.yml、锁文件），不含 node_modules，因此创建与恢复都很快。恢复前会自动为当前状态再建一个检查点。"),
@@ -1635,45 +1618,6 @@ function renderCheckpoints() {
       desc: `共 ${state.checkpoints.length} 个检查点，保存在 ${state.checkpointRoot}`,
       tags: running ? [chip("应用运行中", "warn")] : undefined,
       body: rows.length === 0 ? empty("还没有检查点。执行插件改动时恢复器会自动创建，也可以现在手动创建一个。") : list(rows),
-    }),
-  ];
-}
-
-// --- panel: profile switching ---------------------------------------------
-
-function renderProfiles() {
-  const running = state.running.isRunning;
-  const rows = state.profiles.map((entry) => {
-    const current = entry.name === state.selectedProfile;
-    return row({
-      name: entry.name,
-      mono: true,
-      sub: joinSub(
-        entry.dir,
-        entry.exists !== true ? "目录不存在" : `${entry.plugins.length} 个插件 · ${entry.patchEntries.length} 条补丁`,
-      ),
-      side: current
-        ? [chip("当前 Profile", "ok")]
-        : [button("选择", "select-profile", entry.name, { disabled: false })],
-    });
-  });
-
-  return [
-    hint("切换 Profile 只改变恢复器查看与修复的对象；目标应用实际启动哪个 Profile 由它自己的命令行与配置决定。"),
-    card({
-      title: "可用 Profile",
-      desc: `Profile 根目录：${state.home.profilesDir}`,
-      body: rows.length === 0 ? empty("数据目录下还没有任何 Profile。") : list(rows),
-      actions: [
-        button("打开 Profile 根目录", "open-path", state.home.profilesDir),
-        button("刷新", "refresh", undefined, { className: "btn--ghost" }),
-      ],
-    }),
-    card({
-      title: "新建 Profile",
-      desc:
-        "恢复器不会自行新建 Profile：一个可用的 Profile 需要 pnpm 安装其依赖与组合包。请使用 DSH 自身的 profile 初始化流程（例如 `dsh plugin` / `--from-default-profile`），或先在 DSH 中切换并初始化，之后回到这里修复它。",
-      actions: [button("打开 Profile 根目录", "open-path", state.home.profilesDir), button("打开数据目录", "open-path", state.home.path)],
     }),
   ];
 }
@@ -1687,16 +1631,6 @@ const BACKUP_GROUP_LABEL = {
   workspace: "工作区",
   secret: "凭据",
 };
-
-function backupsGrouped(files) {
-  const groups = new Map();
-  for (const file of files) {
-    const key = file.error === undefined ? "ok" : "broken";
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(file);
-  }
-  return groups;
-}
 
 function renderBackup() {
   const section = state.environmentBackup ?? { available: false, files: [], reason: "尚未读取" };
@@ -1905,8 +1839,27 @@ function rowIncluded(group) {
 function renderData() {
   const running = state.running.isRunning;
   const config = state.config;
+  // Profile switching lives here rather than in its own tab: a profile is a
+  // subdirectory of the data directory, so "which profile am I repairing" and
+  // "which directory holds the profiles" are the same question asked twice.
+  const profileRows = state.profiles.map((entry) => {
+    const current = entry.name === state.selectedProfile;
+    return row({
+      name: entry.name,
+      mono: true,
+      sub: joinSub(
+        entry.dir,
+        entry.exists !== true ? "目录不存在" : `${entry.plugins.length} 个插件 · ${entry.patchEntries.length} 条补丁`,
+      ),
+      side: current ? [chip("当前 Profile", "ok")] : [button("选择", "select-profile", entry.name, { disabled: false })],
+    });
+  });
+
   return [
-    hint("查看或更改 DSH 数据目录。Profile、插件、设置和会话等数据保存在此目录中；更改目录不会删除原目录中的数据。"),
+    hint(
+      "查看或更改 DSH 数据目录，并选择恢复器要查看与修复哪个 Profile。" +
+        "Profile、插件、设置和会话等数据都保存在数据目录里；更改目录不会删除原目录中的数据。",
+    ),
     card({
       icon: "🗄",
       title: "数据管理",
@@ -1915,13 +1868,27 @@ function renderData() {
         ["当前数据目录", state.home.path, true],
         ["默认数据目录", state.home.defaultPath, true],
         ["目录是否存在", state.home.exists === true ? "是" : "否"],
+        ["Profile 根目录", state.home.profilesDir, true],
       ]),
       actions: [
         button("更改数据目录", "choose-home", undefined, { className: "btn--primary" }),
         button("使用默认目录", "reset-home"),
         button("打开数据目录", "open-path", state.home.path),
+        button("打开 Profile 根目录", "open-path", state.home.profilesDir),
         button("打开恢复器配置", "open-path", config.file),
       ],
+    }),
+    card({
+      title: "选择 Profile",
+      desc:
+        `共 ${state.profiles.length} 个 Profile。切换只改变恢复器查看与修复的对象；` +
+        "目标应用实际启动哪个 Profile 由它自己的命令行与配置决定。" +
+        "恢复器不会自行新建 Profile：可用的 Profile 需要 pnpm 装好依赖与组合包，" +
+        "请用 DSH 自身的 profile 初始化流程（例如 `dsh plugin` / `--from-default-profile`），之后回到这里修复它。",
+      tags: state.profiles.length === 0 ? undefined : [chip(`当前 ${state.selectedProfile}`, "mono")],
+      body: profileRows.length === 0 ? empty("数据目录下还没有任何 Profile。") : list(profileRows),
+      actions: [button("刷新", "refresh", undefined, { className: "btn--ghost" })],
+      actionsEnd: true,
     }),
     card({
       icon: "⚠",
