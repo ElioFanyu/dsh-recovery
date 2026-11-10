@@ -307,6 +307,30 @@ const ACTIONS = {
     if (!confirm(`永久删除隔离区中的 ${arg}？\n\n此操作不可撤销。`)) return;
     await run("删除隔离区条目", "discardRemoved", arg);
   },
+  // 卡顿：残留的 dsh-auth-* cookie。删除是不可撤销的（登录状态会一起没），
+  // 所以确认框里先把要发生的事说清楚，并提示自动备份的位置。
+  "cookies-clear-preview": () => run("预览清理内容", "cookiesClear", { dryRun: true }),
+  "cookies-clear": async () => {
+    const info = state.cookies;
+    const summary = info?.summary ?? {};
+    const running = state.running.isRunning;
+    if (running) {
+      toast("DSH 正在运行，Chromium 独占着 cookie 文件；请先停止应用", "error");
+      return;
+    }
+    if (
+      !confirm(
+        "清理残留的登录 cookie：\n\n" +
+          "· 删除 Network\\Cookies 与 Network\\Cookies-journal\n" +
+          (typeof summary.auth === "number" ? `· 其中有 ${summary.auth} 条 dsh-auth-*，${summary.other ?? 0} 条其它网站\n` : "") +
+          "· 会先自动备份一份到 cookie-backups\n" +
+          "· 所有网站的登录状态都会失效（不只是 DSH），需要重新登录\n" +
+          "· 下次启动 DSH 会重新签发一个 cookie\n\n确定继续吗？",
+      )
+    )
+      return;
+    await run("清理残留 cookie", "cookiesClear", {});
+  },
   "sanitize-profile": async () => {
     if (
       !confirm(
@@ -751,6 +775,7 @@ function renderQuick() {
         button("重置插件集", "sanitize-profile", undefined, { className: "btn--danger", disabled: running }),
       ],
     }),
+    cookieCard(running),
   ];
 
   if (source === undefined) {
@@ -769,6 +794,123 @@ function renderQuick() {
   }
 
   return nodes;
+}
+
+/**
+ * 卡顿：残留的 `dsh-auth-*` cookie。
+ *
+ * The defect is three correct-looking decisions stacking up: the port must be
+ * random (right), the cookie name is `sha256(authority)` where the authority
+ * includes that port (so every port gets a distinct name), and the jar is keyed
+ * by host `127.0.0.1` with `Path=/` — no port in the scope — with a 30-day
+ * lifetime. Nothing ever removes an old one, so the jar grows once per launch
+ * for a month. The symptom is slow degradation, not an error, which is exactly
+ * why it needs a visible number instead of a mysterious tip.
+ *
+ * The card leads with the count because that is the only actionable fact: a
+ * handful of stale entries is harmless, hundreds is the bug.
+ */
+function cookieCard(running) {
+  const info = state.cookies;
+  if (info === undefined) return undefined;
+
+  if (info.available !== true) {
+    return card({
+      icon: "🍪",
+      title: "残留的登录 cookie",
+      desc: info.reason ?? "没有找到 DSH 桌面端的 cookie 文件。",
+      actions: [button("刷新", "refresh", undefined, { className: "btn--ghost" })],
+      actionsEnd: true,
+    });
+  }
+
+  const summary = info.summary ?? {};
+  const readable = info.readable === true;
+  const unlocked = running !== true && info.available === true;
+  const unreadable = (info.jars ?? []).filter((jar) => jar.readable !== true);
+
+  // A running app locks the database, so the count is unavailable — say so
+  // instead of printing a confident zero.
+  const headline = readable
+    ? `${summary.auth ?? 0} 条 dsh-auth-* cookie${typeof summary.bytes === "number" ? ` · ${formatBytes(summary.bytes)}` : ""}`
+    : running
+      ? "DSH 正在运行，cookie 文件被独占，暂时读不到条目"
+      : "cookie 文件读不出来，见下方原因";
+
+  const entryRows = [];
+  for (const jar of info.jars ?? []) {
+    for (const entry of jar.rows ?? []) {
+      entryRows.push(
+        row({
+          name: entry.name,
+          mono: true,
+          muted: entry.expired === true,
+          sub: joinSub(entry.host, entry.path, entry.expiresLabel, jar.dir),
+          side: [entry.expired === true ? chip("已过期", "warn") : chip("未过期", "ok")],
+        }),
+      );
+    }
+  }
+
+  const reason = unreadable[0]?.reason ?? "原因未知";
+  const body = readable
+    ? [
+        metrics([
+          ["dsh-auth-* 条目", String(summary.auth ?? 0)],
+          ["其中已过期", String(summary.expired ?? 0)],
+          ["其它网站的 cookie", String(summary.other ?? 0)],
+          ["cookie 文件", formatBytes(summary.bytes)],
+        ]),
+        entryRows.length === 0 ? empty("这个 cookie 库里没有 dsh-auth-* 条目，不需要清理。") : list(entryRows.slice(0, 40)),
+        entryRows.length > 40 ? hint(`只列出前 40 条，实际共 ${entryRows.length} 条；清理会作用于整个文件。`) : undefined,
+      ]
+    : [
+        hint(
+          `读不到 cookie 内容：${reason.replace(/[。.]$/u, "")}。` +
+            "删除不依赖读取，可以在应用停止后直接清掉整个 cookie 文件。",
+        ),
+        list(
+          (info.jars ?? []).map((jar) =>
+            row({
+              name: "Cookies",
+              mono: true,
+              sub: joinSub(jar.file, jar.exists === true ? undefined : "文件不存在", jar.reason),
+              side: [jar.exists === true ? chip(jar.sizeLabel ?? formatBytes(jar.bytes), "mono") : chip("缺失", "warn")],
+            }),
+          ),
+        ),
+      ];
+
+  return card({
+    icon: "🍪",
+    title: "残留的登录 cookie",
+    desc:
+      "DSH 桌面端每次启动随机分配端口，而登录 cookie 的名字里带着端口、" +
+      "作用域却只按主机算（127.0.0.1，不含端口），有效期又是 30 天。" +
+      "三者叠加，每启动一次就多一条不会被清理的 dsh-auth-* cookie，累积到一定数量后应用会越来越慢。" +
+      "清理只删这一个 cookie 库文件与它的 journal，不动数据目录里的任何其它内容。",
+    tags: [
+      chip(headline, readable && (summary.auth ?? 0) > 0 ? "warn" : undefined),
+      readable && (summary.other ?? 0) > 0 ? chip(`会一并清掉 ${summary.other} 条其它网站的 cookie`, "danger") : undefined,
+    ].filter(Boolean),
+    body,
+    actions: [
+      button("清理残留 cookie", "cookies-clear", undefined, {
+        className: "btn--danger",
+        disabled: running || info.available !== true,
+        title: running ? "DSH 正在运行，Chromium 独占着这个文件；请先停止应用" : "删除 Cookies 与 Cookies-journal（删除前自动备份一份）",
+      }),
+      // Preview only reports file paths and sizes, which it already has even when
+      // the contents cannot be read — so it stays available in exactly the state
+      // where the destructive button is not.
+      button("预览清理内容", "cookies-clear-preview", undefined, {
+        className: "btn--ghost",
+        disabled: unlocked !== true || info.available !== true,
+      }),
+      running ? button("停止 DSH", "stop", undefined, { className: "btn--ghost" }) : undefined,
+      info.backupDir === undefined ? undefined : button("打开备份目录", "open-path", info.backupDir),
+    ].filter(Boolean),
+  });
 }
 
 // --- panel: plugins (management + updates on one page) --------------------

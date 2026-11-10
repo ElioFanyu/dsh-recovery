@@ -75,6 +75,10 @@ contextBridge.exposeInMainWorld("recovery", {
   backupRestore: (options) => invoke("recovery:backup-restore", options),
   backupDelete: (file) => invoke("recovery:backup-delete", file),
 
+  // --- 卡顿：残留的 dsh-auth-* cookie -------------------------------------
+  cookiesClear: (options) => invoke("recovery:cookies-clear", options),
+  cookiesRestore: (file) => invoke("recovery:cookies-restore", file),
+
   // --- lifecycle ---------------------------------------------------------
   launchTarget: (options) => invoke("recovery:launch", options),
   stopTarget: () => invoke("recovery:stop"),

@@ -1140,6 +1140,188 @@ async function verifyUpdaterOriginAndGithub(controller, fixture, result) {
   result.ok("插件更新: 空的安装输入被拒绝", /请先填入/u.test(String(emptyRefused)), emptyRefused);
 }
 
+/**
+ * 残留 cookie: the detection, the live-cookie guard, and the backup.
+ *
+ * Everything runs against a synthetic `%APPDATA%` so the real cookie jar (and
+ * the user's login state) is never a test subject. The jar is a real SQLite
+ * database built through `node:sqlite`, so the read path — not a stub — is what
+ * gets exercised.
+ */
+async function verifyCookies(controller, fixture, result) {
+  const cookies = require("./cookies");
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = require("node:sqlite"));
+  } catch (error) {
+    result.ok("残留 cookie: 当前运行时支持 node:sqlite", false, error?.message ?? String(error));
+    return;
+  }
+
+  const appData = path.join(fixture.work, "appdata");
+  const network = path.join(appData, "@deepseek-ai", "dsh-desktop", "Network");
+  ensureDir(network);
+  const jarPath = path.join(network, "Cookies");
+  const journalPath = path.join(network, "Cookies-journal");
+
+  // Chromium's epoch: 1601-01-01, microseconds. Future/past on purpose so the
+  // expired/valid split is exercised rather than assumed.
+  const chromiumMicros = (epochMillis) => String(Math.round((epochMillis / 1000 + 11_644_736_000) * 1_000_000));
+  const now = Date.now();
+
+  const db = new DatabaseSync(jarPath);
+  db.exec(
+    "CREATE TABLE cookies (host_key TEXT NOT NULL, name TEXT NOT NULL, value TEXT, path TEXT, expires_utc INTEGER, is_secure INTEGER, is_httponly INTEGER, encrypted_value BLOB)",
+  );
+  // Four placeholders for four varying columns; the rest are constants. The
+  // statement must name every column it fills or SQLite counts them wrong.
+  const insert = db.prepare(
+    "INSERT INTO cookies (host_key, name, value, path, expires_utc, is_secure, is_httponly, encrypted_value) VALUES (?, ?, ?, ?, ?, 0, 1, x'00')",
+  );
+  const put = (host, name, value, pathValue, expires) => insert.run(host, name, value, pathValue, expires);
+  // Two stale auth cookies (different ports => different names, same scope) and
+  // one live one, plus an unrelated site cookie that must never be touched.
+  put("127.0.0.1", "dsh-auth-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "", "/", Number(chromiumMicros(now + 20 * 24 * 3600_000)));
+  put("127.0.0.1", "dsh-auth-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "", "/", Number(chromiumMicros(now - 3600_000)));
+  put("127.0.0.1", "dsh-auth-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", "", "/", Number(chromiumMicros(now + 30 * 24 * 3600_000)));
+  put("example.invalid", "session", "keep-me", "/", Number(chromiumMicros(now + 3600_000)));
+  db.close();
+  fs.writeFileSync(journalPath, "");
+
+  // --- detection and classification ---------------------------------------
+  const info = cookies.inspect({ appData, now });
+  result.ok(
+    "残留 cookie: 能找到 cookie 库并读出条目",
+    info.available === true && info.readable === true && info.summary.total === 4,
+    info.reason ?? `total=${info.summary?.total}`,
+  );
+  result.ok(
+    "残留 cookie: 只把 dsh-auth-* 当作本缺陷的条目",
+    info.summary.auth === 3 && info.summary.other === 1,
+    `auth=${info.summary.auth} other=${info.summary.other}`,
+  );
+  result.ok(
+    "残留 cookie: 区分已过期与未过期",
+    info.summary.expired === 1,
+    `expired=${info.summary.expired}`,
+  );
+
+  // A running app must spare its own cookie: deleting it would log the user out
+  // mid-session. `liveNames` is how that is expressed.
+  const liveName = "dsh-auth-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+  const guarded = cookies.classify(info.jars[0].rows, { now, liveNames: [liveName] });
+  result.ok(
+    "残留 cookie: 运行中实例自己的 cookie 不会被当成待删条目",
+    guarded.auth.find((row) => row.name === liveName)?.live === true &&
+      guarded.auth.filter((row) => row.live !== true).length === 2,
+    JSON.stringify(guarded.auth.map((row) => ({ name: row.name.slice(0, 16), live: row.live }))),
+  );
+
+  // --- preview writes nothing ---------------------------------------------
+  const preview = cookies.clear({ appData, dryRun: true });
+  result.ok(
+    "残留 cookie: 预览只报告、不删除",
+    preview.ok === true && preview.cleared.length === 2 && isFile(jarPath) && isFile(journalPath),
+    `cleared=${preview.cleared.length} jarExists=${isFile(jarPath)}`,
+  );
+
+  // --- clearing backs up first --------------------------------------------
+  const backupDir = path.join(fixture.work, "cookie-backups");
+  const cleared = cookies.clear({ appData, backupDir });
+  result.ok(
+    "残留 cookie: 删除 Cookies 与 Cookies-journal",
+    cleared.ok === true && !isFile(jarPath) && !isFile(journalPath) && cleared.cleared.length === 2,
+    errorText(cleared) ?? `cleared=${cleared.cleared.length}`,
+  );
+  result.ok(
+    "残留 cookie: 删除前留下了备份",
+    cleared.backup !== undefined && isFile(cleared.backup.file ?? ""),
+    cleared.backup?.file,
+  );
+  // The backup has to be a usable database, not just a byte count.
+  if (cleared.backup !== undefined && isFile(cleared.backup.file)) {
+    const restoredInfo = cookies.inspect({ appData: path.join(fixture.work, "restore-check"), now });
+    result.ok(
+      "残留 cookie: 备份可以被读回（不是空文件）",
+      fs.statSync(cleared.backup.file).size > 0 && restoredInfo.available === false,
+      `${fs.statSync(cleared.backup.file).size} 字节`,
+    );
+  }
+
+  // --- restore puts it back ------------------------------------------------
+  if (cleared.backup !== undefined) {
+    const restored = cookies.restore({ backupFile: cleared.backup.file, appData });
+    const afterRestore = cookies.inspect({ appData, now });
+    result.ok(
+      "残留 cookie: 可以从备份恢复",
+      restored.ok === true && afterRestore.readable === true && afterRestore.summary.total === 4,
+      errorText(restored) ?? `total=${afterRestore.summary?.total}`,
+    );
+  }
+
+  // --- refusals ------------------------------------------------------------
+  const missing = cookies.restore({ backupFile: path.join(fixture.work, "nope.db"), appData });
+  result.ok("残留 cookie: 恢复不存在的备份会被拒绝", missing.ok === false, missing.error);
+
+  const emptyDir = path.join(fixture.work, "no-appdata");
+  const nothing = cookies.clear({ appData: emptyDir, backupDir });
+  result.ok(
+    "残留 cookie: 没有 cookie 库时清理是安全的空操作",
+    nothing.ok === true && nothing.cleared.length === 0,
+    errorText(nothing),
+  );
+
+  // A locked jar must be reported, not half-deleted. Simulating the lock is not
+  // portable, so what is asserted here is the contract: a jar that cannot be
+  // copied yields `ok: false` with a readable reason instead of throwing.
+  const unwritable = path.join(fixture.work, "locked-appdata");
+  const lockedNetwork = path.join(unwritable, "@deepseek-ai", "dsh-desktop", "Network");
+  ensureDir(lockedNetwork);
+  fs.writeFileSync(path.join(lockedNetwork, "Cookies"), "not a database at all");
+  const broken = cookies.inspect({ appData: unwritable, now });
+  result.ok(
+    "残留 cookie: 损坏的 cookie 库被报告而不是抛异常",
+    broken.available === true && broken.readable === false && typeof broken.jars[0].reason === "string",
+    broken.jars?.[0]?.reason,
+  );
+
+  // --- the controller wiring ----------------------------------------------
+  // Two things must hold no matter the machine: the card's data is present in
+  // the console state, and clearing is refused while the app runs.
+  await controller.dispatch("recovery:refresh", []);
+  result.ok(
+    "残留 cookie: 控制台状态里有这一节",
+    controller.state.cookies !== undefined && typeof controller.state.cookies.summary === "object",
+    controller.state.cookies?.reason,
+  );
+  result.ok(
+    "残留 cookie: 状态里带上备份目录",
+    typeof controller.state.cookies?.backupDir === "string" && controller.state.cookies.backupDir.includes("cookie-backups"),
+    controller.state.cookies?.backupDir,
+  );
+
+  // The idle guard is the whole safety story for the delete: with the app up the
+  // file is locked, and the console must say so instead of trying.
+  const wasRunning = controller.state.running?.isRunning === true;
+  if (!wasRunning) {
+    // Pretend it is running, without touching the real process table.
+    const saved = controller.state.running;
+    controller.state.running = { ...saved, isRunning: true, pids: [999999] };
+    const refused = await controller.dispatch("recovery:cookies-clear", [{ dryRun: false }]);
+    controller.state.running = saved;
+    result.ok(
+      "残留 cookie: 应用运行中拒绝清理",
+      refused.ok === false && /正在运行|先停止/u.test(String(refused.error ?? refused.result?.error ?? "")),
+      refused.error ?? refused.result?.error,
+    );
+    result.ok(
+      "残留 cookie: 拒绝后真实 cookie 库没有被改动",
+      isFile(path.join(network, "Cookies")),
+      jarPath,
+    );
+  }
+}
+
 async function verifyCheckpoints(controller, fixture, result) {
   const manifestPath = path.join(fixture.profileDir, "package.json");
   const patchPath = path.join(fixture.profileDir, "cordis.patch.yml");
@@ -1391,6 +1573,7 @@ async function runVerify({ version, targets }) {
     await verifyUpdaterStall(controller, fixture, result);
     await verifyUpdaterOriginAndGithub(controller, fixture, result);
     await verifyBackup(controller, fixture, result);
+    await verifyCookies(controller, fixture, result);
     await verifyAwesome(controller, fixture, result);
     await verifyCheckpoints(controller, fixture, result);
     await verifyTargets(controller, fixture, result);

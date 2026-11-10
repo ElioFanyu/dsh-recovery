@@ -24,10 +24,22 @@ const restartButton = require("./restart-button");
 const updater = require("./plugin-updater");
 const awesome = require("./awesome");
 const backup = require("./backup");
+const cookies = require("./cookies");
 
 function isWithin(parent, child) {
   const relative = path.relative(parent, child);
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+/**
+ * Where a deleted cookie jar is backed up before it goes.
+ *
+ * Deleting cookies is not reversible on its own, and every site the user is
+ * signed into (not just DSH) loses its session. A copy next to the other
+ * recovery artifacts is the difference between "cleanup" and "surprise".
+ */
+function cookiesBackupsDir() {
+  return path.join(paths.PROJECT_ROOT, "cookie-backups");
 }
 
 function describeError(error) {
@@ -170,6 +182,10 @@ class RecoveryController {
       // 环境备份: what a bundle would contain right now, plus the ones already
       // written. Read-only; every export/restore is a channel below.
       environmentBackup: this.summarizeBackup(home),
+      // 快速恢复 → 卡顿: the Desktop app's Chromium cookie jar, whose
+      // `dsh-auth-*` entries accumulate once per random port for 30 days.
+      // Read-only; cleanup is the `recovery:cookies-clear` channel.
+      cookies: this.summarizeCookies(),
       lastAction: this.lastAction,
       busy: this.busy,
     };
@@ -354,6 +370,61 @@ class RecoveryController {
   /** `~/.agents` — shared with other agent tools, so it is never the DSH home. */
   agentsBase() {
     return path.join(require("node:os").homedir(), ".agents");
+  }
+
+  /**
+   * Delete the stale cookie files, after backing them up.
+   *
+   * `dryRun` reports exactly what would be removed without touching anything —
+   * the panel offers it as 「预览清理」, the same shape the updater uses.
+   */
+  async clearStaleCookies(options = {}) {
+    const dryRun = options.dryRun === true;
+    return this.perform(dryRun ? "预览清理 cookie" : "清理残留 cookie", async () => {
+      this.requireIdle();
+      const outcome = cookies.clear({ backupDir: cookiesBackupsDir(), dryRun });
+      if (outcome.ok !== true) throw new Error(outcome.error ?? "清理 cookie 失败");
+      return {
+        ...outcome,
+        backupDir: cookiesBackupsDir(),
+        dryRun,
+        // The jar is the thing that made DSH slow; say what is left, not just
+        // what was deleted.
+        after: outcome.cleared.length === 0 ? undefined : "重启 DSH 后会重新签发一个 cookie；其它网站的登录状态也被一并清除了。",
+      };
+    });
+  }
+
+  /** Put a backed-up jar back. Idle-gated for the same lock reason. */
+  async restoreCookieBackup(file) {
+    if (typeof file !== "string" || file === "") {
+      return { ok: false, error: "缺少要恢复的备份文件", state: this.state };
+    }
+    return this.perform("恢复 cookie 备份", async () => {
+      this.requireIdle();
+      const outcome = cookies.restore({ backupFile: file });
+      if (outcome.ok !== true) throw new Error(outcome.error);
+      return outcome;
+    });
+  }
+
+
+  /**
+   * Stale `dsh-auth-*` cookies in the Desktop app's Chromium jar.
+   *
+   * Read-only and never throws: the interesting states here are "the app is
+   * running so the file is locked" and "there is no jar at all", and both must
+   * render as data. Reading is safe while the app runs (the copy fails, and
+   * that is reported); deleting is not, so `clearStaleCookies()` is idle-gated.
+   */
+  summarizeCookies() {
+    const running = this.state?.running?.isRunning === true;
+    try {
+      const info = cookies.inspect({ running });
+      return { ...info, backupDir: cookiesBackupsDir() };
+    } catch (error) {
+      return { available: false, reason: describeError(error), jars: [], summary: { total: 0, auth: 0, other: 0, expired: 0, live: 0, removable: 0 } };
+    }
   }
 
   /** A backup file the user picked, validated as one of ours before it is trusted. */
@@ -560,6 +631,20 @@ class RecoveryController {
       }
       case "recovery:show-item":
         return this.showItem(String(args[0] ?? ""));
+
+      // -- 卡顿：残留的 dsh-auth-* cookie ------------------------------------
+      //
+      // Deleting is idle-gated, and that is not a limitation: Chromium holds the
+      // cookie database with an exclusive lock for as long as the app runs, so
+      // the file literally cannot be replaced while it is up. It also happens to
+      // be the only safe moment — with the app stopped, every `dsh-auth-*` entry
+      // belongs to a dead port, so "delete them all" needs no guess about which
+      // cookie is live.
+      case "recovery:cookies-clear":
+        return this.clearStaleCookies(args[0] ?? {});
+
+      case "recovery:cookies-restore":
+        return this.restoreCookieBackup(String(args[0] ?? ""));
 
       // -- 环境备份 ---------------------------------------------------------
       //

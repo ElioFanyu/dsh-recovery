@@ -5,6 +5,10 @@
 
 ![快速恢复](docs/quick-recovery-tab.png)
 
+| 残留的登录 cookie（快速恢复页下方） |
+| --- |
+| ![残留的登录 cookie](docs/cookie-card.png) |
+
 | 插件管理（管理 + 更新） | 回滚 | 数据与 Profile |
 | --- | --- | --- |
 | ![插件管理](docs/plugins-tab.png) | ![回滚](docs/checkpoints-tab.png) | ![数据与 Profile](docs/data-tab.png) |
@@ -74,7 +78,7 @@ setup-runtime.cmd --list
 
 | 页面 | 能力 |
 | --- | --- |
-| 快速恢复 | 以**安全模式**启动（临时环境，不读原有插件/设置/会话，退出后自动清理）；正常启动；跳转插件管理；重置插件集。打开目录的入口统一收在「数据与 Profile」与「诊断」，这里不再重复 |
+| 快速恢复 | 以**安全模式**启动（临时环境，不读原有插件/设置/会话，退出后自动清理）；正常启动；跳转插件管理；重置插件集；**清理残留的登录 cookie**（见下文「为什么 DSH 会越用越慢」）。打开目录的入口统一收在「数据与 Profile」与「诊断」，这里不再重复 |
 | 插件管理 | **一页管全部插件**。按来源分组（本地插件 / 联网插件 / 内置组件），每行给出：启用/禁用、打开（本地插件定位到它的工作副本文件夹，联网插件打开项目主页）、**升级**（仅联网插件）、卸载到**隔离区**并可还原；顶部操作条有**一键启用全部插件**（并解除补丁层 `disabled: true`）与**修复插件状态**。下方卡片：安装/升级插件市场、**安装一个插件**（包名或 GitHub 地址）、不一致的插件、更新前风险、隔离区、「其他依赖」。直接对**已停止的 Profile** 执行 pnpm，用于绕开应用内「更新卡在 remove」与「市场不能更新自己」两个宿主缺陷，详见下文 |
 | 回滚 | 列出检查点（槽位）、创建、恢复、删除；**一键删除全部检查点**；每个检查点记录插件清单、组合包列表、补丁和被禁用的行 |
 | **收录插件** | 按 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) 的 `contributing.md` 逐条核对插件仓库，生成可直接提交的 `data/plugins/<owner>__<repo>.yml`；「必须修正」可**一键复制给 AI 修改**；指定列表克隆后还能查重并写入。**只读**，不需要停止 DSH。规则与流程见 [docs/awesome-plugin-submission.md](docs/awesome-plugin-submission.md) |
@@ -171,6 +175,64 @@ IM 的群历史与群文件、`profiles/.dsh-recovery/`（恢复器自己的检�
 不会写入配置。选择结果保存进 `dsh-recovery.config.json` 的 `targets`，下次启动照旧生效。
 这三条动作也进了 `--verify`（8 项检查），且用 `persist: false` 在内存里跑，
 真实配置文件前后按字节比对不变。
+
+### 为什么 DSH 会越用越慢：残留的登录 cookie
+
+这一节的结论不是猜的，全部来自已发布源码（`@deepseek-ai/dsh-client-connection`）：
+
+```js
+// lib/index.js:335
+function cookieName(authority) {
+  return COOKIE_PREFIX + encodeBase64Url(createHash("sha256").update(authority).digest());
+}
+
+// lib/index.js:307 —— authority 来自 Host 头，含端口
+function requestAudience(headers, secure) {
+  const host = header(headers, "host");
+  const url = new URL(`${secure ? "https:" : "http:"}//${host}`);
+  return secure ? url.origin : url.host;   // ← url.host 带端口
+}
+
+// lib/index.js:348 —— 作用域只有 Path=/，没有端口
+const attributes = `${name}=${value}; Max-Age=${...}; Path=/; ...; SameSite=Strict`;
+
+// lib/index.js:1017 —— 默认 30 天
+cookieMaxAgeDays: z.natural().min(1).default(30),
+```
+
+三个各自都正确的决定叠在一起就成了缺陷：
+
+| 决定 | 单独看 | 合在一起 |
+| --- | --- | --- |
+| 端口随机分配 | 正确（避免端口冲突） | 每次启动端口都不同 |
+| cookie 名 = `sha256(authority)`，含端口 | 看不出问题 | **每换一个端口就多一个 cookie 名** |
+| cookie 作用域按主机算（`127.0.0.1`，不含端口）、`Path=/` | 符合 Cookie 规范 | 几百个名字挤在**同一个主机**下 |
+| 生命周期 30 天 | 合理 | 一个月内**没有任何东西会删掉旧的** |
+
+于是每启动一次就多一条 `dsh-auth-*`，累积到一定数量后应用会变慢。**它不报错，只是越来越慢** —— 所以这一页给的是数字，不是玄学建议。
+
+#### 这一页做什么
+
+「快速恢复 → 残留的登录 cookie」：
+
+| 元素 | 含义 |
+| --- | --- |
+| `dsh-auth-*` 条目 | 当前 cookie 库里属于这个缺陷的条目数。个位数无害，上百条就是问题 |
+| 其中已过期 / 其它网站的 cookie | 分别统计，因为清理会连带清掉其它站点 —— 这点必须在按钮旁边说清楚 |
+| **清理残留 cookie** | 删除 `Network\Cookies` 与 `Network\Cookies-journal`（**删除前自动备份**到 `cookie-backups\`） |
+| 预览清理内容 | 只报告会删什么，不写任何东西 |
+| 打开备份目录 | 反悔时从备份恢复 |
+
+**为什么必须停止 DSH 才能清理**：Chromium 运行期间对 cookie 库持有独占锁（实测 `EBUSY: resource busy or locked`）。这看起来是限制，其实是保证 —— 应用停止时，库里所有 `dsh-auth-*` 都属于已经消失的端口，所以「全部删掉」不需要猜哪一个还是活的。运行中删除自己的 cookie 会把人踢下线，那条路径根本不该存在。
+
+清理的实际代价：**所有网站**的登录状态都会失效（不只是 DSH），下次启动 DSH 会重新签发一个。所以按钮旁直接写了这条，而不是藏在确认框里。
+
+#### 实现要点
+
+- 读 cookie 用内置 `node:sqlite`（Electron 自带，零依赖）。`expires_utc` 是 Chromium 的 1601 纪元微秒数，**超出 `Number.MAX_SAFE_INTEGER`**，必须当字符串读、用 `BigInt` 解析，否则 `node:sqlite` 直接抛 `Value is too large to be represented as a JavaScript number`（本次开发真的踩到了）。
+- 只认 `dsh-auth-` 前缀，其它站点的 cookie 只统计不点名。
+- `appData` 可覆盖，`--verify` 因此能在一次性目录里建真 SQLite 库跑完整流程；**覆盖生效时不会再回落到真实 `%APPDATA%`**（早期版本有这个泄漏，会让自检删掉用户真 cookie，已修并加了「不在覆盖目录内就拒绝删除」的二次防线）。
+- 备份按文件分别保留：只留最后一个会把空的 `Cookies-journal` 备份下来、把数据库丢掉（同样踩过）。
 
 ### 插件管理：管理与更新为什么是同一页
 
@@ -276,10 +338,10 @@ DSH Desktop 的应用内更新有两个**宿主侧**缺陷，都定位到了具�
 | 命令 | 覆盖范围 | 是否改动磁盘 |
 | --- | --- | --- |
 | `--self-check` | 只读链路：目标探测、Profile 清单与补丁解析、检查点列表、运行状态 | 完全不写 |
-| `--verify` | 全部写操作：插件启用/禁用/**一键启用全部（含补丁层 disabled 解除）**/卸载/还原/永久删除、**插件来源分类（本地/联网/内置）与「打开」目标解析**、检查点创建/恢复/删除/**一键删除全部**、**手动指定/移除安装位置**（含无效目录拒绝）、**插件市场缺失/已装的判定与安装**、**环境备份导出/预览/恢复到空目录/恶意包拒绝**、安全模式启动、停止（精确匹配进程）、诊断包导出 | 只写一次性 fixture 与 `.safemode\`，结束前自清理 |
-| `--ui-check` | 真开窗口渲染一遍界面：**八个**页签的数量与名称（并断言不再有独立的「插件更新」与「切换 Profile」）、`window.recovery` 桥接口、两个「一键」按钮的存在与禁用态、**诊断页「安装位置」按钮**、**插件行「打开」按钮与来源标签**、**市场卡片按装没装显示「安装插件市场」或「升级到最新」**、**页脚在未运行/运行中两种状态下的按钮组合**（防 `undefined` 文字）、点开「重启按钮」页签后的活动面板与按钮可用性、**「环境备份」页签的两个导出按钮与「不含凭据」措辞**，并截图（含快速恢复 / 插件管理 / 回滚 / 收录插件 / 环境备份 / 数据与 Profile / 诊断七张附加截图） | 只写截图 |
+| `--verify` | 全部写操作：插件启用/禁用/**一键启用全部（含补丁层 disabled 解除）**/卸载/还原/永久删除、**插件来源分类（本地/联网/内置）与「打开」目标解析**、检查点创建/恢复/删除/**一键删除全部**、**手动指定/移除安装位置**（含无效目录拒绝）、**插件市场缺失/已装的判定与安装**、**环境备份导出/预览/恢复到空目录/恶意包拒绝**、**残留 cookie 的识别/预览不写/备份/恢复/运行中拒绝清理**、安全模式启动、停止（精确匹配进程）、诊断包导出 | 只写一次性 fixture 与 `.safemode\`，结束前自清理 |
+| `--ui-check` | 真开窗口渲染一遍界面：**八个**页签的数量与名称（并断言不再有独立的「插件更新」与「切换 Profile」）、`window.recovery` 桥接口、两个「一键」按钮的存在与禁用态、**诊断页「安装位置」按钮**、**插件行「打开」按钮与来源标签**、**市场卡片按装没装显示「安装插件市场」或「升级到最新」**、**页脚在未运行/运行中两种状态下的按钮组合**（防 `undefined` 文字）、点开「重启按钮」页签后的活动面板与按钮可用性、**「环境备份」页签的两个导出按钮与「不含凭据」措辞**、**「残留的登录 cookie」卡片的存在、「文件被占用时不报条目数」的措辞**，并截图（含快速恢复 / 插件管理 / 回滚 / 收录插件 / 环境备份 / 数据与 Profile / 诊断七张附加截图，外加单独滚到视野的残留 cookie 卡片） | 只写截图 |
 
-`--verify`（114 项检查）在每次运行时构造一个合成环境 `\.runtime\verify-<时间戳>\`：
+`--verify`（130 项检查）在每次运行时构造一个合成环境 `\.runtime\verify-<时间戳>\`：
 一份假的安装目录（`resources\app\package.json` 声明为 `@deepseek-ai/dsh-desktop`）和一份假的
 Profile，然后用**内存里的** `config` 指向它去跑真实动作，因此：
 
@@ -317,7 +379,7 @@ dsh-recovery/
     main.js               Electron 主进程（窗口、IPC 注册、--self-check / --verify / --ui-check）
     assets/               图标：icon.png（1024px，窗口用）+ icon.ico（16–256px 多尺寸，快捷方式用）
     preload.js            contextBridge：暴露 window.recovery.*
-    backend/              零依赖后端（paths/profile/checkpoints/diagnostics/zip/launcher/asar/ipc/util/verify/restart-button/backup）
+    backend/              零依赖后端（paths/profile/checkpoints/diagnostics/zip/launcher/asar/ipc/util/verify/restart-button/backup/cookies）
     renderer/             原生 DOM 渲染界面（index.html / app.js / styles.css）
   tools/
     make-icon.py          重新生成 app/assets 下的 icon.png / icon.ico（Pillow）
@@ -327,6 +389,7 @@ dsh-recovery/
   docs/                   README 用的界面截图
   diagnostics/            导出的诊断包（按需创建）
   backups/                环境备份的 .zip（按需创建，已在 .gitignore 中）
+  cookie-backups/         清理残留 cookie 前留的原文件副本（按需创建，含登录凭据，已忽略）
   dsh-recovery.config.json 记住的目标/Profile/数据目录
 ```
 
@@ -349,6 +412,36 @@ dsh-recovery/
 - 自动扫描只找常见根目录下的一层子目录；装在别处需要用**诊断 → 安装位置**手动指定（见上）。
 
 ## 版本记录
+
+### 2026-11-10 · v1.8.0 · 快速恢复：清理残留的 dsh-auth-* cookie
+
+- 版本号 `1.7.0` → `1.8.0`。「快速恢复」新增「残留的登录 cookie」卡片：
+  统计 cookie 库里 `dsh-auth-*` 的条目数与过期情况，可预览、可清理
+  （删 `Network\Cookies` 与 `Network\Cookies-journal`，**删除前自动备份**到 `cookie-backups\`）。
+- 缺陷来源已逐行核实，不是推测：`dsh-client-connection` 的 cookie 名是
+  `sha256(authority)` 而 authority 含端口（`requestAudience` 返回 `url.host`）、
+  作用域却是 `Path=/` + 主机 `127.0.0.1`（不含端口）、`cookieMaxAgeDays` 默认 30。
+  三者叠加 = 每启动一次多一条永不清理的 cookie。详见「为什么 DSH 会越用越慢」一节。
+- 新增 `app/backend/cookies.js`（约 430 行）：定位、只读解析、分类、备份、删除、恢复。
+  读 cookie 用 Electron 自带的 `node:sqlite`，**零第三方依赖**。
+- 两个新通道 `recovery:cookies-clear` / `recovery:cookies-restore`，删除走
+  `perform` + `requireIdle`：Chromium 运行期独占 cookie 库（实测 `EBUSY`），
+  所以只能在应用停止时清理 —— 而这恰好也是唯一安全的时刻（所有旧端口都已消失，
+  不可能误删正在用的 cookie）。
+- 开发中修掉三个自己踩出来的坑，都是会伤到用户的：
+  1. `expires_utc` 是 Chromium 的 1601 纪元微秒数，超出 `Number.MAX_SAFE_INTEGER`，
+     `node:sqlite` 读成 Number 会抛 `Value is too large…`。改为 SQL 里 `CAST AS TEXT`
+     + `BigInt` 解析。
+  2. `cookieDirs()` 在 `appData` 覆盖生效时仍回落到真实 `%APPDATA%`，会让 `--verify`
+     删掉用户真 cookie。已修，并加「不在覆盖目录内就拒绝删除」的二次防线。
+  3. 备份只保留最后一个文件，于是空的 `Cookies-journal` 覆盖了数据库的备份。
+     改为按文件分别保留。
+- `--verify` 增至 **130 项**（新增 16 项）：识别与分类、运行中实例自己的 cookie 不被
+  当作待删条目、预览不写、删除+备份、备份可恢复、损坏库报错不抛异常、应用运行中拒绝清理。
+  断言有效性已验证：故意去掉 live-cookie 保护后，对应用例立刻失败。
+- `--ui-check` 新增断言：卡片存在、两个按钮存在、**文件被占用时不得报出条目数**
+  （会误导），并单独把卡片滚进视野截图（`docs/cookie-card.png`）。
+- `.gitignore` 增加 `cookie-backups/`：cookie 库等同于登录凭据，与 `backups/` 同等对待。
 
 ### 2026-11-10 · v1.7.0 · 「切换 Profile」并入数据页，清掉死代码与错位入口
 

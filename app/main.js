@@ -75,6 +75,8 @@ const CHANNELS = [
   "recovery:backup-preview",
   "recovery:backup-restore",
   "recovery:backup-delete",
+  "recovery:cookies-clear",
+  "recovery:cookies-restore",
   "recovery:launch",
   "recovery:stop",
   "recovery:restart",
@@ -183,6 +185,8 @@ async function runUiCheck({ shot }) {
     "awesomeForgetDir",
     "awesomeCheck",
     "awesomeWrite",
+    "cookiesClear",
+    "cookiesRestore",
     "backupExport",
     "backupChooseFile",
     "backupPreview",
@@ -225,7 +229,24 @@ async function runUiCheck({ shot }) {
   }
   const footerText = await win.webContents.executeJavaScript("document.getElementById('footer-actions')?.innerText ?? ''");
   if (/undefined/u.test(footerText)) issues.push(`页脚出现了 undefined 文字：${footerText.trim()}`);
-  // The reported bug only appears while the application is stopped, which the
+
+  // 残留的 dsh-auth-* cookie: the card must exist on 快速恢复 with both actions,
+  // and the destructive one must be disabled while the app is running — that is
+  // the state Chromium's exclusive lock enforces anyway, so a live button would
+  // only produce a failure toast.
+  const quickPanel = await win.webContents.executeJavaScript(`${panelProbe}("quick")`);
+  if (quickPanel === null) issues.push("找不到「快速恢复」面板");
+  else {
+    if (!quickPanel.text.includes("残留的登录 cookie")) issues.push("快速恢复面板缺少「残留的登录 cookie」卡片");
+    for (const action of ["cookies-clear", "cookies-clear-preview"]) {
+      if (!quickPanel.actions.some((button) => button.action === action)) issues.push(`残留 cookie 卡片缺少按钮 ${action}`);
+    }
+    if (!quickPanel.text.includes("dsh-auth-")) issues.push("残留 cookie 卡片没有说明受影响的 cookie 前缀");
+    // The card must not claim a count it could not read.
+    const lockWording = quickPanel.text.includes("被独占");
+    const hasCount = /\d+\s*条\s*dsh-auth-/u.test(quickPanel.text);
+    if (lockWording && hasCount) issues.push("残留 cookie 卡片在文件被占用时仍然报出了条目数（会误导）");
+  }  // The reported bug only appears while the application is stopped, which the
   // live window cannot always reproduce (it may well be running). Ask the
   // renderer for both states of the real builder instead.
   //
@@ -425,6 +446,23 @@ async function runUiCheck({ shot }) {
     for (const action of ["choose-target", "choose-target-exe"]) {
       if (!diagnosticsPanel.actions.some((button) => button.action === action)) issues.push(`诊断面板缺少按钮 ${action}`);
     }
+  }
+
+  // 残留 cookie 卡片在「快速恢复」的最下方，滚动后的整页截图看不到它，
+  // 所以单独把它滚进视野再拍一张，作为这次新增功能的可视证据。
+  await win.webContents.executeJavaScript('document.querySelector(\'[data-action="tab"][data-arg="quick"]\').click()');
+  await sleep(400);
+  {
+    const cookieCardFound = await win.webContents.executeJavaScript(`(() => {
+      const cards = [...document.querySelectorAll('.panel[data-panel="quick"] section.card')];
+      const target = cards.find((c) => (c.querySelector('.card__title')?.textContent ?? '').includes('残留的登录 cookie'));
+      if (target === undefined) return false;
+      target.scrollIntoView({ block: 'start' });
+      return true;
+    })()`);
+    if (cookieCardFound !== true) issues.push("快速恢复面板里找不到「残留的登录 cookie」卡片");
+    await sleep(500);
+    fs.writeFileSync(shot.replace(/\\.png$/i, "-cookie-card.png"), (await win.webContents.capturePage()).toPNG());
   }
 
   await win.webContents.executeJavaScript("document.querySelector('[data-action=\"tab\"][data-arg=\"restart\"]').click()");

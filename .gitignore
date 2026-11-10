@@ -8,6 +8,10 @@ diagnostics/
 # 环境备份：本机配置（可能含凭据）的打包产物，绝不能进版本库
 backups/
 
+# 清理残留 cookie 前留的原文件副本。cookie 库等同于登录凭据（含所有网站的会话），
+# 与 backups/ 同等对待：只在本机留存，不进版本库。
+cookie-backups/
+
 # 按机器生成的配置与「按目标归档」布局的状态文件
 dsh-recovery.config.json
 state-*.json
