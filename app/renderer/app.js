@@ -17,18 +17,24 @@ window.addEventListener("error", (event) => {
 
 const TABS = [
   { id: "quick", label: "快速恢复" },
-  { id: "plugins", label: "插件管理", badge: (value) => value.selectedProfileDetail?.plugins?.length },
-  // The market cannot update some plugins on Desktop (notably itself) and its
-  // remove path can stall; this tab performs the same operations against the
-  // stopped profile, so it advertises only the problems it can act on.
+  // One tab for both halves of plugin work. They used to be two (插件管理 and
+  // 插件更新) rendering the same package list from two backends; the market
+  // cannot update some plugins on Desktop (notably itself) and its remove path
+  // can stall, so installing/upgrading against the stopped profile belongs
+  // next to enable/disable rather than behind a second tab.
+  //
+  // The badge prefers the number of things that need attention, because that is
+  // why someone opens the page; the plain plugin count is the fallback.
   {
-    id: "updater",
-    label: "插件更新",
+    id: "plugins",
+    label: "插件管理",
     badge: (value) => {
       const updater = value.pluginUpdater;
-      if (updater === undefined || updater.available !== true) return updater === undefined ? undefined : "!";
-      const count = (updater.inconsistent?.length ?? 0) + (updater.stale?.length ?? 0) + (updater.diagnose?.stuck?.length ?? 0);
-      return count === 0 ? undefined : count;
+      if (updater !== undefined && updater.available === true) {
+        const count = (updater.inconsistent?.length ?? 0) + (updater.stale?.length ?? 0) + (updater.diagnose?.stuck?.length ?? 0);
+        if (count > 0) return count;
+      }
+      return value.selectedProfileDetail?.plugins?.length;
     },
   },
   { id: "checkpoints", label: "回滚", badge: (value) => value.checkpoints.length },
@@ -432,9 +438,13 @@ const ACTIONS = {
     }
     await run("预览安装", "pluginInstall", spec, true);
   },
-  "plugin-install": async () => {
+  "plugin-install": async (arg) => {
+    // Two entry points feed this: the input box (no arg) and the 重新安装 button
+    // on an inconsistent row, which passes the package name as the arg. Reading
+    // only the input box meant that button toasted "请先填入…" and did nothing.
     const input = document.getElementById("plugin-install-input");
-    const spec = typeof input?.value === "string" ? input.value.trim() : "";
+    const fromInput = typeof input?.value === "string" ? input.value.trim() : "";
+    const spec = typeof arg === "string" && arg.trim() !== "" ? arg.trim() : fromInput;
     if (spec === "") {
       toast("请先填入要安装的包名或 GitHub 地址", "error");
       return;
@@ -459,10 +469,10 @@ const ACTIONS = {
   "plugin-install-market": async () => {
     if (
       !confirm(
-        "安装插件市场：\\n\\n" +
-          "· 用 pnpm 把 dshmarket 装进当前 Profile，并加入插件层\\n" +
-          "· 市场是应用内安装/浏览插件的入口，装好后重启 DSH 才会出现\\n" +
-          "· 执行前会自动创建检查点，可随时回滚\\n\\n确定继续吗？",
+        "安装插件市场：\n\n" +
+          "· 用 pnpm 把 dshmarket 装进当前 Profile，并加入插件层\n" +
+          "· 市场是应用内安装/浏览插件的入口，装好后重启 DSH 才会出现\n" +
+          "· 执行前会自动创建检查点，可随时回滚\n\n确定继续吗？",
       )
     )
       return;
@@ -685,7 +695,6 @@ function renderPanels() {
   clear(host);
   host.append(panel("quick", renderQuick()));
   host.append(panel("plugins", renderPlugins()));
-  host.append(panel("updater", renderUpdater()));
   host.append(panel("awesome", renderAwesome()));
   host.append(panel("checkpoints", renderCheckpoints()));
   host.append(panel("restart", renderRestartButton()));
@@ -778,8 +787,25 @@ function renderQuick() {
   return nodes;
 }
 
-// --- panel: plugin management ---------------------------------------------
+// --- panel: plugins (management + updates on one page) --------------------
 
+/**
+ * Everything about the profile's plugins, in one tab.
+ *
+ * This used to be two tabs: 插件管理 (enable / disable / uninstall / open) and
+ * 插件更新 (pnpm install / upgrade / repair). They rendered the *same* package
+ * list from two different backends — `profile.listPlugins` and
+ * `plugin-updater.inspectProfile` — with different names for the same facts
+ * (`enabled`/`inBundles`, `source`/`origin`), so the reader had to translate
+ * between two views of one thing. The row below merges them by package name:
+ * identity, grouping and the open target come from the profile reader, while
+ * problems and upgradability come from the updater.
+ *
+ * The update half exists because of two host-side defects: the in-app updater
+ * can stall on `hmr.runExclusive()` after pnpm already deleted the package, and
+ * `dshmarket` refuses to update itself. Both disappear when the package change
+ * happens while the app is stopped, which is what this console arranges.
+ */
 function renderPlugins() {
   const detail = state.selectedProfileDetail;
   if (detail === undefined || detail.exists !== true) {
@@ -787,8 +813,14 @@ function renderPlugins() {
   }
 
   const running = state.running.isRunning;
-  const bundles = detail.plugins.filter((plugin) => plugin.bundle === true);
-  const others = detail.plugins.filter((plugin) => plugin.bundle !== true);
+  const info = state.pluginUpdater;
+  const updaterReady = info !== undefined && info.available === true;
+  const updaterRows = updaterReady ? (info.rows ?? []) : [];
+  const updaterByName = new Map(updaterRows.map((entry) => [entry.name, entry]));
+
+  const plugins = detail.plugins;
+  const bundles = plugins.filter((plugin) => plugin.bundle === true);
+  const others = plugins.filter((plugin) => plugin.bundle !== true);
   const allEnabled = bundles.every((plugin) => plugin.enabled === true);
   const offCount = bundles.filter((plugin) => plugin.enabled !== true).length;
   const patchDisabledCount = (detail.patchEntries ?? []).filter((entry) => entry.disabled === true).length;
@@ -802,10 +834,18 @@ function renderPlugins() {
   const builtinPlugins = bundles.filter((plugin) => plugin.source === "builtin" || plugin.source === undefined);
   const enabledCount = bundles.filter((plugin) => plugin.enabled === true).length;
 
+  const stuck = info?.diagnose?.stuck ?? [];
+  const notes = info?.diagnose?.notes ?? [];
+  const stale = info?.stale ?? [];
+  const inconsistent = info?.inconsistent ?? [];
+  const risks = info?.risks ?? [];
+  const problemCount = stuck.length + stale.length + inconsistent.length;
+
   const nodes = [
     panelBar(
       `已启用 ${enabledCount} / ${bundles.length} 个插件 · 本地 ${localPlugins.length} · 联网 ${registryPlugins.length}` +
-        (patchDisabledCount > 0 ? ` · 补丁层禁用 ${patchDisabledCount} 条` : ""),
+        (patchDisabledCount > 0 ? ` · 补丁层禁用 ${patchDisabledCount} 条` : "") +
+        (problemCount > 0 ? ` · ${problemCount} 处需要处理` : ""),
       [
         button("一键启用全部插件", "enable-all-bundles", undefined, {
           className: "btn--primary",
@@ -818,269 +858,48 @@ function renderPlugins() {
                 ? "所有插件都已启用"
                 : `把另外 ${offCount} 个可加载的插件一次性加入插件层`,
         }),
-        button("刷新", "refresh", undefined, { className: "btn--ghost" }),
-      ],
-    ),
-    hint(
-      "查看当前 Profile 中安装的插件。可以禁用插件（保留安装，启动时不加载），也可以彻底卸载（移入隔离区，可随时还原）。" +
-        "按来源分成三组：本地插件用 `link:` 指向工作副本（「打开」定位到该文件夹）；联网插件从 npm 装进 Profile（「打开」打开其项目主页）；内置组件随应用发布。" +
-        (running ? " 目标应用正在运行，改动类操作已暂时禁用。" : ""),
-    ),
-  ];
-
-  if (bundles.length === 0) {
-    nodes.push(card({ title: "插件", desc: `Profile ${detail.name} · 清单 ${detail.manifestPath}`, body: empty("这个 Profile 还没有启用任何插件。") }));
-  }
-
-  if (localPlugins.length > 0) {
-    nodes.push(
-      card({
-        title: "本地插件",
-        icon: "📁",
-        desc: `用 link: 指向工作副本的插件：「打开」会在文件管理器中定位它的真实目录，改代码立即生效。${localPlugins.length} 个。`,
-        tags: [chip(`${localPlugins.length} 个`, "ok")],
-        body: list(localPlugins.map((plugin) => pluginRow(plugin, running))),
-      }),
-    );
-  }
-
-  if (registryPlugins.length > 0) {
-    const noHome = registryPlugins.filter((plugin) => typeof plugin.homepage !== "string").length;
-    nodes.push(
-      card({
-        title: "联网插件",
-        icon: "🌐",
-        desc:
-          `从 npm 安装进 Profile 的插件：「打开」会在浏览器打开项目主页。${registryPlugins.length} 个` +
-          (noHome > 0 ? `，其中 ${noHome} 个没有声明 homepage / repository，无法打开主页。` : "。"),
-        tags: [chip(`${registryPlugins.length} 个`)],
-        body: list(registryPlugins.map((plugin) => pluginRow(plugin, running))),
-      }),
-    );
-  }
-
-  if (builtinPlugins.length > 0) {
-    nodes.push(
-      card({
-        title: "内置组件",
-        icon: "🧩",
-        desc: "随应用一起发布的组件，不能禁用也不能卸载；「打开」定位到 Profile 内的安装副本。",
-        tags: [chip(`${builtinPlugins.length} 个`, "muted")],
-        body: list(builtinPlugins.map((plugin) => pluginRow(plugin, running))),
-      }),
-    );
-  }
-
-  if (others.length > 0) {
-    nodes.push(
-      card({
-        title: "其他依赖",
-        desc: "这些包不是插件组合包（未声明 dsh.bundle.patch），无法作为插件层启停，只列出以便确认安装状态。",
-        body: list(
-          others.map((plugin) =>
-            row({
-              name: plugin.name,
-              mono: true,
-              muted: true,
-              sub: joinSub(
-                plugin.categoryLabel,
-                plugin.version,
-                plugin.installedLocal === true ? undefined : "未安装在本地",
-                plugin.source === "local" ? plugin.sourcePath ?? plugin.spec : undefined,
-              ),
-              side: [
-                plugin.source === "local" ? chip("本地", "ok") : undefined,
-                chip(plugin.enabled === true ? "在插件层中" : "未启用", plugin.enabled === true ? "ok" : undefined),
-              ],
-            }),
-          ),
-        ),
-      }),
-    );
-  }
-
-  if (detail.removed.length > 0) {
-    nodes.push(
-      card({
-        title: "隔离区",
-        desc: "已卸载的包保存在 Profile 内的 .dsh-recovery/removed 下。还原会把包目录与依赖声明一起写回 Profile。",
-        body: list(
-          detail.removed.map((entry) =>
-            row({
-              name: entry.name ?? entry.id,
-              mono: true,
-              sub: joinSub(entry.version, entry.removedAt === undefined ? undefined : new Date(entry.removedAt).toLocaleString("zh-CN"), entry.id),
-              side: [
-                button("还原", "restore-removed", entry.id),
-                button("永久删除", "discard-removed", entry.id, { className: "btn--danger" }),
-              ],
-            }),
-          ),
-        ),
-      }),
-    );
-  }
-
-  nodes.push(
-    card({
-      title: "Profile 补丁",
-      desc: `cordis.patch.yml 由 DSH 与用户共同维护。恢复器只在「一键启用全部插件」时把 disabled: true 改成 false，其余内容一律不动（重置插件集时会另存为 .bak）。共 ${detail.patchEntries.length} 条，其中 ${detail.patchDisabledCount} 条为禁用。`,
-      body:
-        detail.patchEntries.length === 0
-          ? empty("补丁文件中没有条目。")
-          : list(
-              detail.patchEntries.map((entry) =>
-                row({
-                  name: entry.id,
-                  mono: true,
-                  muted: entry.disabled === true,
-                  sub: joinSub(entry.name, entry.disabled === true ? "disabled: true" : undefined),
-                  side: [chip(entry.disabled === true ? "禁用" : "启用", entry.disabled === true ? "warn" : "ok")],
-                }),
-              ),
-            ),
-      actions: [button("打开插件补丁", "open-path", detail.patchPath), button("在文件夹中显示", "show-item", detail.patchPath)],
-      actionsEnd: true,
-    }),
-  );
-
-  return nodes;
-}
-
-function pluginRow(plugin, running) {
-  const core = plugin.core === true;
-  const cannotUninstall = core || plugin.quarantinable !== true;
-  const local = plugin.source === "local";
-  const builtin = plugin.source === "builtin" || plugin.source === undefined;
-  // The row's "open" target follows the source: a local working copy opens its
-  // folder, a registry plugin opens its homepage. Both are decided in the
-  // backend from the same row data, so this only has to know whether one is
-  // available at all.
-  const canOpen = local || builtin ? plugin.installedLocal === true || typeof plugin.sourcePath === "string" : typeof plugin.homepage === "string";
-  const sourceChip = local ? chip("本地", "ok") : builtin ? chip("内置", "muted") : chip("联网");
-  return row({
-    name: plugin.name,
-    mono: true,
-    plugin: true,
-    sub: joinSub(
-      plugin.categoryLabel,
-      plugin.version,
-      plugin.installedLocal === true ? undefined : "未安装在本地",
-      local ? plugin.sourcePath ?? plugin.spec : undefined,
-    ),
-    side: [
-      sourceChip,
-      chip(plugin.enabled === true ? "已启用" : "已禁用", plugin.enabled === true ? "ok" : undefined),
-      button(local || builtin ? "打开文件夹" : "打开官网", "open-plugin", plugin.name, {
-        className: "btn--ghost",
-        disabled: canOpen !== true,
-        title:
-          canOpen !== true
-            ? local || builtin
-              ? "找不到该插件的目录"
-              : "package.json 里没有 homepage / repository"
-            : local || builtin
-              ? `在文件管理器中定位 ${plugin.sourcePath ?? plugin.installedPath ?? ""}`
-              : `在浏览器中打开 ${plugin.homepage}`,
-      }),
-      button(plugin.enabled === true ? "禁用" : "启用", "toggle-bundle", plugin.name, {
-        disabled: running || (core && plugin.enabled === true) || (plugin.enabled !== true && plugin.declared !== true),
-        title: core
-          ? "启动必需的组件，不能禁用"
-          : plugin.enabled !== true && plugin.declared !== true
-            ? "该包不在 Profile 依赖中，请先用 DSH 安装"
-            : undefined,
-      }),
-      button("卸载", "uninstall-bundle", plugin.name, {
-        className: "btn--danger",
-        disabled: running || cannotUninstall,
-        title: core ? "内置组件不可卸载" : plugin.quarantinable !== true ? "包不在本地，无法移入隔离区" : undefined,
-      }),
-    ],
-  });
-}
-
-// --- panel: plugin updater ------------------------------------------------
-
-/**
- * Why this panel exists rather than "just use the market": on DSH Desktop 0.2.1
- * the in-app update path runs `removeBundle()` → pnpm → `hmr.runExclusive()`,
- * and that queue never settles if a plugin's teardown does. pnpm has already
- * deleted the old copy by then, so the UI sticks on "Removing…" and the plugin
- * is gone after a restart. The market also refuses to update itself
- * (`market-self-update`) because removing it unloads the code that would run
- * the reinstall. Both disappear when the package change happens with the app
- * stopped — which is exactly what this console can arrange.
- */
-function renderUpdater() {
-  const info = state.pluginUpdater;
-  const running = state.running.isRunning;
-
-  if (info === undefined) {
-    return [hint("插件更新数据尚未读取，请点「刷新」。")];
-  }
-  if (info.available !== true) {
-    return [
-      hint(`无法读取 Profile 的插件状态：${info.reason ?? "未知原因"}`),
-      hint(`Profile 目录：${info.profileDir ?? "—"}`),
-    ];
-  }
-
-  const stuck = info.diagnose?.stuck ?? [];
-  const notes = info.diagnose?.notes ?? [];
-  const stale = info.stale ?? [];
-  const inconsistent = info.inconsistent ?? [];
-  const rows = info.rows ?? [];
-  const installed = rows.filter((entry) => entry.version !== undefined && entry.declared !== undefined);
-  const problemCount = stuck.length + stale.length + inconsistent.length;
-
-  const nodes = [
-    panelBar(
-      problemCount === 0 ? "插件状态一致" : `发现 ${problemCount} 处需要处理`,
-      [
         button("修复插件状态", "plugin-repair", undefined, {
-          className: "btn--primary",
-          disabled: running,
-          title: running ? "目标应用正在运行，请先停止或退出应用" : "清理僵死的写入锁与运行记录，并让插件层与磁盘保持一致",
+          disabled: running || updaterReady !== true,
+          title: running
+            ? "目标应用正在运行，请先停止或退出应用"
+            : updaterReady !== true
+              ? "插件更新数据尚未读取，请点「刷新」"
+              : "清理僵死的写入锁与运行记录，并让插件层与磁盘保持一致",
         }),
-        button("预览修复内容", "plugin-repair-preview", undefined, { className: "btn--ghost" }),
+        button("预览修复内容", "plugin-repair-preview", undefined, {
+          className: "btn--ghost",
+          disabled: updaterReady !== true,
+        }),
         button("刷新", "refresh", undefined, { className: "btn--ghost" }),
       ],
     ),
     hint(
-      "这些操作直接对 Profile 执行 pnpm，等价于在 DSH 完全退出后手工升级。应用运行时会禁用写入 —— 该状态下市场自己的更新会卡在 HMR 队列上，这里不会。" +
-        (info.pnpm === undefined
-          ? " 未找到 pnpm，安装/升级/卸载不可用（修复仍可用）。"
-          : ` 使用 ${info.pnpm.source}${info.pnpm.version === undefined ? "" : ` 的 pnpm ${info.pnpm.version}`}。`),
+      "一页管全部插件：把插件加入或移出插件层（启用 / 禁用）、卸载到隔离区、打开它的目录或主页，以及装卸和升级（直接对 Profile 跑 pnpm）。" +
+        "改动前会自动创建检查点，可随时回滚。" +
+        (running ? " 目标应用正在运行，写入类操作已暂时禁用。" : ""),
     ),
-    running ? card({ danger: true, title: "请先退出 DSH", desc: `应用正在运行（PID ${runningPidText(state.running)}）。请用下方「停止」或直接退出 DSH（含托盘图标），然后刷新本页。运行中写入会被应用退出流程覆盖。` }) : undefined,
+    running
+      ? card({
+          danger: true,
+          title: "请先退出 DSH",
+          desc: `应用正在运行（PID ${runningPidText(state.running)}）。请用下方「停止」或直接退出 DSH（含托盘图标），然后刷新本页。运行中写入会被应用退出流程覆盖。`,
+        })
+      : undefined,
   ];
 
-  // --- what may make this update slow --------------------------------------
-  // An update can legitimately take a while (lockfile policy check, no hard
-  // links, a stale lock). Saying so up front is the difference between "slow"
-  // and "it froze"; the run itself is bounded by a timeout either way.
-  const risks = info.risks ?? [];
-  if (risks.length > 0) {
+  if (updaterReady !== true) {
     nodes.push(
-      card({
-        title: "更新前需要知道的情况",
-        desc: "这些不是错误，但会让本次更新变慢或容易失败。更新本身有超时上限，不会无限卡住。",
-        tags: [chip(`${risks.length} 项`, risks.some((risk) => risk.level === "warn") ? "warn" : undefined)],
-        body: list(
-          risks.map((risk) =>
-            row({
-              name: risk.text,
-              muted: risk.level !== "warn",
-              side: [chip(risk.level === "warn" ? "建议先处理" : "说明", risk.level === "warn" ? "warn" : undefined)],
-            }),
-          ),
-        ),
-      }),
+      hint(
+        `无法读取这个 Profile 的插件更新数据，安装 / 升级 / 修复暂时不可用：${info?.reason ?? "状态中没有插件更新信息"}。` +
+          "上面的插件列表仍然可用。",
+      ),
     );
   }
 
   // --- what went wrong last time ------------------------------------------
+  // Only the update half knows this: the market's own log and the lock files it
+  // leaves behind. Shown before the list because it is why someone opened the
+  // page in the first place.
   if (stuck.length > 0) {
     nodes.push(
       card({
@@ -1127,7 +946,6 @@ function renderUpdater() {
     );
   }
 
-  // --- inconsistencies ----------------------------------------------------
   if (inconsistent.length > 0) {
     nodes.push(
       card({
@@ -1151,91 +969,123 @@ function renderUpdater() {
     );
   }
 
+  // --- the plugins themselves ---------------------------------------------
+  if (bundles.length === 0) {
+    nodes.push(card({ title: "插件", desc: `Profile ${detail.name} · 清单 ${detail.manifestPath}`, body: empty("这个 Profile 还没有启用任何插件。") }));
+  }
+
+  if (localPlugins.length > 0) {
+    nodes.push(
+      card({
+        title: `本地插件（${localPlugins.length}）`,
+        icon: "📁",
+        desc: "用 link: / 符号链接指向本机工作副本的插件，代码在它自己的文件夹里。「打开文件夹」定位到那本目录，改代码立即生效。这里不提供升级 —— pnpm 升级会把这个链接换成 registry 下载的副本，你的工作副本就被断开了。",
+        tags: [chip(`${localPlugins.length} 个`, "ok")],
+        body: list(localPlugins.map((plugin) => pluginRow(plugin, updaterByName.get(plugin.name), running))),
+      }),
+    );
+  }
+
+  if (registryPlugins.length > 0) {
+    const noHome = registryPlugins.filter((plugin) => typeof plugin.homepage !== "string").length;
+    nodes.push(
+      card({
+        title: `联网插件（${registryPlugins.length}）`,
+        icon: "🌐",
+        desc:
+          `从 npm 安装进 Profile 的插件：「打开官网」打开项目主页，「升级」用 pnpm 重新解析最新版本（包括固定版本号的那些），装完再校验入口文件与插件层条目。${registryPlugins.length} 个` +
+          (noHome > 0 ? `，其中 ${noHome} 个没有声明 homepage / repository，无法打开主页。` : "。"),
+        tags: [chip(`${registryPlugins.length} 个`)],
+        body: list(registryPlugins.map((plugin) => pluginRow(plugin, updaterByName.get(plugin.name), running))),
+      }),
+    );
+  }
+
+  if (builtinPlugins.length > 0) {
+    nodes.push(
+      card({
+        title: `内置组件（${builtinPlugins.length}）`,
+        icon: "🧩",
+        desc: "随应用一起发布的组件，不能禁用也不能卸载；「打开文件夹」定位到 Profile 内的安装副本。",
+        tags: [chip(`${builtinPlugins.length} 个`, "muted")],
+        body: list(builtinPlugins.map((plugin) => pluginRow(plugin, updaterByName.get(plugin.name), running))),
+      }),
+    );
+  }
+
+  if (others.length > 0) {
+    nodes.push(
+      card({
+        title: "其他依赖",
+        desc: "这些包不是插件组合包（未声明 dsh.bundle.patch），无法作为插件层启停，只列出以便确认安装状态。",
+        body: list(
+          others.map((plugin) =>
+            row({
+              name: plugin.name,
+              mono: true,
+              muted: true,
+              sub: joinSub(
+                plugin.categoryLabel,
+                plugin.version,
+                plugin.installedLocal === true ? undefined : "未安装在本地",
+                plugin.source === "local" ? plugin.sourcePath ?? plugin.spec : undefined,
+              ),
+              side: [
+                plugin.source === "local" ? chip("本地", "ok") : undefined,
+                chip(plugin.enabled === true ? "在插件层中" : "未启用", plugin.enabled === true ? "ok" : undefined),
+              ],
+            }),
+          ),
+        ),
+      }),
+    );
+  }
+
+  if (detail.removed.length > 0) {
+    nodes.push(
+      card({
+        title: "隔离区",
+        desc: "已卸载的包保存在 Profile 内的 .dsh-recovery/removed 下。还原会把包目录与依赖声明一起写回 Profile。",
+        body: list(
+          detail.removed.map((entry) =>
+            row({
+              name: entry.name ?? entry.id,
+              mono: true,
+              sub: joinSub(entry.version, entry.removedAt === undefined ? undefined : new Date(entry.removedAt).toLocaleString("zh-CN"), entry.id),
+              side: [button("还原", "restore-removed", entry.id), button("永久删除", "discard-removed", entry.id, { className: "btn--danger" })],
+            }),
+          ),
+        ),
+      }),
+    );
+  }
+
   // --- the market itself: install it, or update it -------------------------
   // Two different situations, one card. A profile without the market has no
   // in-app entry to install it (the market IS the install entry), so the
   // console is the only place that can put it there; a profile with the market
   // cannot update it from inside either. Which button shows is decided by
   // `market.installed`, never by guessing from the row list.
-  const market = info.market ?? { name: "dshmarket", installed: false };
-  nodes.push(
-    card({
-      icon: "🛒",
-      title: market.installed ? "更新插件市场本身" : "安装插件市场",
-      desc: market.installed
-        ? "桌面端的市场不能在自己发起的请求里更新自己（会先把市场从运行中的组合里摘掉，补装那一步就执行不到了），应用内也没有更新入口。这一项只能在这里做。"
-        : "这个 Profile 里没有插件市场（dshmarket）。市场本身就是应用内安装插件的入口，缺了它应用里就没有任何安装页面 —— 所以只能在这里装上。",
-      body: metrics([
-        market.installed
-          ? ["当前版本", market.version ?? "—"]
-          : ["状态", "尚未安装"],
-        ["声明", market.declared ?? "—"],
-        ["插件层", market.inBundles ? "已启用" : market.installed ? "未在插件层" : "—"],
-      ]),
-      actions: market.installed
-        ? [
-            button("升级到最新", "plugin-update", market.name, { className: "btn--primary", disabled: running }),
-            button("检查安装", "plugin-check", market.name),
-          ]
-        : [
-            button("安装插件市场", "plugin-install-market", undefined, { className: "btn--primary", disabled: running }),
-            button("预览安装", "plugin-install-market-preview", undefined, { className: "btn--ghost", disabled: running }),
-          ],
-    }),
-  );
-
-  // --- installed plugins, split by where they came from --------------------
-  // 联网 and 本地 are not the same kind of thing. A registry package is a
-  // downloaded copy, so "升级" resolves a newer one. A local plugin is a `link:`
-  // pointing at a working copy on this machine: pnpm has no upgrade for it, and
-  // `pnpm add name@latest` would replace the link with a registry download and
-  // silently detach the folder the user actually edits. Offering the button
-  // there would be a trap, so local rows get 检查 only.
-  const registryPlugins = installed.filter((entry) => entry.origin !== "local").sort((left, right) => left.name.localeCompare(right.name, "en"));
-  const localPlugins = installed.filter((entry) => entry.origin === "local").sort((left, right) => left.name.localeCompare(right.name, "en"));
-
-  const pluginRow = (entry, updatable) =>
-    row({
-      name: entry.name,
-      mono: true,
-      muted: entry.problems.length > 0,
-      sub: joinSub(
-        entry.version,
-        entry.declared === entry.version ? undefined : `声明 ${entry.declared}`,
-        entry.bundle ? undefined : "非插件包",
-        updatable ? undefined : "本地工作副本",
-      ),
-      side: [
-        chip(entry.inBundles ? "插件层" : "未启用", entry.inBundles ? "ok" : undefined),
-        updatable ? button("升级", "plugin-update", entry.name, { className: "btn--primary", disabled: running }) : undefined,
-        button("检查", "plugin-check", entry.name, { className: "btn--ghost" }),
-        updatable ? undefined : button("打开文件夹", "open-plugin", entry.name, { className: "btn--ghost" }),
-      ],
-    });
-
-  if (installed.length === 0) {
-    nodes.push(card({ title: "已安装的插件", body: empty("这个 Profile 还没有安装任何插件。") }));
-  } else {
+  if (updaterReady) {
+    const market = info.market ?? { name: "dshmarket", installed: false };
     nodes.push(
       card({
-        icon: "🌐",
-        title: `联网插件（${registryPlugins.length}）`,
-        desc: "从 npm 安装的包。升级会用 pnpm 重新解析最新版本（包括固定版本号的那些），装完再校验入口文件与插件层条目。",
-        body:
-          registryPlugins.length === 0
-            ? empty("没有联网安装的插件。")
-            : list(registryPlugins.map((entry) => pluginRow(entry, true))),
-      }),
-    );
-    nodes.push(
-      card({
-        icon: "📁",
-        title: `本地插件（${localPlugins.length}）`,
-        desc: "用 link: / 符号链接指向本机工作副本的插件，代码在它自己的文件夹里。这里不提供升级 —— pnpm 升级会把这个链接换成 registry 下载的副本，你的工作副本就被断开了。改代码请直接在它的文件夹里改。",
-        body:
-          localPlugins.length === 0
-            ? empty("没有本地插件。")
-            : list(localPlugins.map((entry) => pluginRow(entry, false))),
+        icon: "🛒",
+        title: market.installed ? "更新插件市场本身" : "安装插件市场",
+        desc: market.installed
+          ? "桌面端的市场不能在自己发起的请求里更新自己（会先把市场从运行中的组合里摘掉，补装那一步就执行不到了），应用内也没有更新入口。这一项只能在这里做。"
+          : "这个 Profile 里没有插件市场（dshmarket）。市场本身就是应用内安装插件的入口，缺了它应用里就没有任何安装页面 —— 所以只能在这里装上。",
+        body: metrics([
+          market.installed ? ["当前版本", market.version ?? "—"] : ["状态", "尚未安装"],
+          ["声明", market.declared ?? "—"],
+          ["插件层", market.inBundles ? "已启用" : market.installed ? "未在插件层" : "—"],
+        ]),
+        actions: market.installed
+          ? [button("升级到最新", "plugin-update", market.name, { className: "btn--primary", disabled: running }), button("检查安装", "plugin-check", market.name)]
+          : [
+              button("安装插件市场", "plugin-install-market", undefined, { className: "btn--primary", disabled: running }),
+              button("预览安装", "plugin-install-market-preview", undefined, { className: "btn--ghost", disabled: running }),
+            ],
       }),
     );
   }
@@ -1263,11 +1113,103 @@ function renderUpdater() {
     }),
   );
 
+  // --- what may make this update slow --------------------------------------
+  // An update can legitimately take a while (lockfile policy check, no hard
+  // links, a stale lock). Saying so up front is the difference between "slow"
+  // and "it froze"; the run itself is bounded by a timeout either way.
+  if (risks.length > 0) {
+    nodes.push(
+      card({
+        title: "更新前需要知道的情况",
+        desc: "这些不是错误，但会让本次更新变慢或容易失败。更新本身有超时上限，不会无限卡住。",
+        tags: [chip(`${risks.length} 项`, risks.some((risk) => risk.level === "warn") ? "warn" : undefined)],
+        body: list(
+          risks.map((risk) =>
+            row({
+              name: risk.text,
+              muted: risk.level !== "warn",
+              side: [chip(risk.level === "warn" ? "建议先处理" : "说明", risk.level === "warn" ? "warn" : undefined)],
+            }),
+          ),
+        ),
+      }),
+    );
+  }
+
   if (notes.length > 0) {
-    nodes.push(card({ title: "日志说明", desc: "以下情况已经不需要处理，仅作记录。", body: list(notes.map((note) => row({ name: note, muted: true })) ) }));
+    nodes.push(card({ title: "日志说明", desc: "以下情况已经不需要处理，仅作记录。", body: list(notes.map((note) => row({ name: note, muted: true }))) }));
   }
 
   return nodes.filter((node) => node !== undefined);
+}
+
+/**
+ * One plugin row: what it is, where to open it, and both halves of its actions.
+ *
+ * 升级 appears only for a registry package that is both installed and declared.
+ * A `link:` working copy must never get it — `pnpm add name@latest` would
+ * replace the link with a registry download and silently detach the folder the
+ * user actually edits — and pnpm has nothing to upgrade when the package is not
+ * on disk. Such rows get 检查 instead, which is the only useful verb there.
+ */
+function pluginRow(plugin, updaterRow, running) {
+  const core = plugin.core === true;
+  const cannotUninstall = core || plugin.quarantinable !== true;
+  const local = plugin.source === "local";
+  const builtin = plugin.source === "builtin" || plugin.source === undefined;
+  // The row's "open" target follows the source: a local working copy opens its
+  // folder, a registry plugin opens its homepage. Both are decided in the
+  // backend from the same row data, so this only has to know whether one is
+  // available at all.
+  const canOpen = local || builtin ? plugin.installedLocal === true || typeof plugin.sourcePath === "string" : typeof plugin.homepage === "string";
+  const problems = updaterRow?.problems ?? [];
+  const upgradable = !local && !builtin && updaterRow !== undefined && updaterRow.version !== undefined && updaterRow.declared !== undefined;
+  return row({
+    name: plugin.name,
+    mono: true,
+    plugin: true,
+    muted: problems.length > 0,
+    sub: joinSub(
+      plugin.categoryLabel,
+      plugin.version,
+      plugin.installedLocal === true ? undefined : "未安装在本地",
+      local ? plugin.sourcePath ?? plugin.spec : undefined,
+      problems.length > 0 ? problems.join("；") : undefined,
+    ),
+    side: [
+      chip(plugin.enabled === true ? "已启用" : "已禁用", plugin.enabled === true ? "ok" : undefined),
+      button(local || builtin ? "打开文件夹" : "打开官网", "open-plugin", plugin.name, {
+        className: "btn--ghost",
+        disabled: canOpen !== true,
+        title:
+          canOpen !== true
+            ? local || builtin
+              ? "找不到该插件的目录"
+              : "package.json 里没有 homepage / repository"
+            : local || builtin
+              ? `在文件管理器中定位 ${plugin.sourcePath ?? plugin.installedPath ?? ""}`
+              : `在浏览器中打开 ${plugin.homepage}`,
+      }),
+      upgradable
+        ? button("升级", "plugin-update", plugin.name, { className: "btn--primary", disabled: running })
+        : local
+          ? button("检查", "plugin-check", plugin.name, { className: "btn--ghost" })
+          : undefined,
+      button(plugin.enabled === true ? "禁用" : "启用", "toggle-bundle", plugin.name, {
+        disabled: running || (core && plugin.enabled === true) || (plugin.enabled !== true && plugin.declared !== true),
+        title: core
+          ? "启动必需的组件，不能禁用"
+          : plugin.enabled !== true && plugin.declared !== true
+            ? "该包不在 Profile 依赖中，请先用 DSH 安装"
+            : undefined,
+      }),
+      button("卸载", "uninstall-bundle", plugin.name, {
+        className: "btn--danger",
+        disabled: running || cannotUninstall,
+        title: core ? "内置组件不可卸载" : plugin.quarantinable !== true ? "包不在本地，无法移入隔离区" : undefined,
+      }),
+    ],
+  });
 }
 
 // --- panel: 收录插件 (awesome-dsh-plugin submission) ----------------------

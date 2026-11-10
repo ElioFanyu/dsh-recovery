@@ -1010,7 +1010,7 @@ class RecoveryController {
           const profileDir = path.join(home, "profiles", profileName);
           const installDir = updater.installDirOf(this.state?.selected);
           if (updater.resolvePnpm(installDir) === undefined) {
-            install = { ok: false, error: "找不到可用的 pnpm，插件没有自动安装；配置文件已恢复，可在「插件更新」页手动安装。" };
+            install = { ok: false, error: "找不到可用的 pnpm，插件没有自动安装；配置文件已恢复，可在「插件管理」页手动安装。" };
           } else {
             try {
               const run = await updater.__runPnpm(profileDir, updater.resolvePnpm(installDir), ["install", "--config.minimum-release-age=0", "--ignore-scripts", "--config.side-effects-cache=false"]);

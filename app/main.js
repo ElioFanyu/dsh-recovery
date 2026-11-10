@@ -153,15 +153,17 @@ async function runUiCheck({ shot }) {
   if (typeof before.error === "string") {
     throw new Error(`渲染失败：${before.error}；控制台：${JSON.stringify(consoleMessages.slice(-8))}`);
   }
-  // Nine panels: 收录插件 joined the eight so that adding a plugin to
-  // awesome-dsh-plugin becomes a checked, guided operation instead of manual
-  // YAML editing.
-  if (before.tabs.length !== 10) issues.push(`页签数量为 ${before.tabs.length}，期望 10`);
+  // Nine panels. 插件管理 and 插件更新 were merged into one tab: both rendered
+  // the same package list from two different backends (`profile.listPlugins`
+  // and `plugin-updater.inspectProfile`) under two sets of field names, so the
+  // reader had to translate between two views of one thing.
+  if (before.tabs.length !== 9) issues.push(`页签数量为 ${before.tabs.length}，期望 9`);
   if (!before.tabs.some((label) => label.includes("重启按钮"))) issues.push("页签中没有「重启按钮」");
-  if (!before.tabs.some((label) => label.includes("插件更新"))) issues.push("页签中没有「插件更新」");
+  if (!before.tabs.some((label) => label.includes("插件管理"))) issues.push("页签中没有「插件管理」");
+  if (before.tabs.some((label) => label.includes("插件更新"))) issues.push("页签中仍有独立的「插件更新」（应已并入「插件管理」）");
   if (!before.tabs.some((label) => label.includes("收录插件"))) issues.push("页签中没有「收录插件」");
   if (!before.tabs.some((label) => label.includes("环境备份"))) issues.push("页签中没有「环境备份」");
-  if (before.panelCount !== 10) issues.push(`面板数量为 ${before.panelCount}，期望 10`);
+  if (before.panelCount !== 9) issues.push(`面板数量为 ${before.panelCount}，期望 9`);
   for (const method of [
     "restartButtonApply",
     "restartButtonRevert",
@@ -262,16 +264,18 @@ async function runUiCheck({ shot }) {
     else if (checkpointsPanel.text.includes("还没有检查点") && sweep.disabled !== true) issues.push("没有检查点时「一键删除全部」按钮仍可点击");
   }
 
-  // The updater panel must expose its actions even on a healthy profile: an
-  // update is a manual action, not a repair, so "no problems" cannot hide it.
-  const updaterPanel = await win.webContents.executeJavaScript(`${panelProbe}("updater")`);
-  if (updaterPanel === null) issues.push("找不到「插件更新」面板");
+  // The plugin panel carries both halves now: management (enable / disable /
+  // uninstall / open) and updates (pnpm install / upgrade / repair). The actions
+  // must be there even on a healthy profile: an update is a manual action, not a
+  // repair, so "no problems" cannot hide it.
+  const updaterPanel = pluginsPanel;
+  if (updaterPanel === null) issues.push("找不到「插件管理」面板（同时也承载插件更新）");
   else {
     for (const action of ["plugin-repair", "plugin-update", "plugin-install"]) {
-      if (!updaterPanel.actions.some((button) => button.action === action)) issues.push(`插件更新面板缺少按钮 ${action}`);
+      if (!updaterPanel.actions.some((button) => button.action === action)) issues.push(`插件管理面板缺少按钮 ${action}`);
     }
     if (!updaterPanel.text.includes("插件市场") && !updaterPanel.text.includes("dshmarket")) {
-      issues.push("插件更新面板没有提到插件市场自身");
+      issues.push("插件管理面板没有提到插件市场自身");
     }
     // 安装市场 and 升级市场 are mutually exclusive, and which one is right
     // depends on the machine: a profile without the market must offer the
@@ -287,7 +291,7 @@ async function runUiCheck({ shot }) {
     // printed a version, or an update card with no version, would contradict
     // itself on screen.
     if (marketInstalled === updaterPanel.text.includes("尚未安装")) {
-      issues.push(`插件更新：市场卡片的状态与按钮不一致（installed=${marketInstalled}）`);
+      issues.push(`插件管理：市场卡片的状态与按钮不一致（installed=${marketInstalled}）`);
     }
     if (marketInstalled) {
       if (installMarket !== undefined) issues.push("插件市场已安装，却仍显示「安装插件市场」按钮");
@@ -306,10 +310,10 @@ async function runUiCheck({ shot }) {
       (button) => button.action === "plugin-check" && button.arg === "dshmarket",
     );
     if (clickable === undefined) {
-      issues.push("插件更新面板没有可点击的市场「检查安装」按钮");
+      issues.push("插件管理面板没有可点击的市场「检查安装」按钮");
     } else if (clickable.disabled !== true) {
       await win.webContents.executeJavaScript(
-        `document.querySelector('.panel[data-panel="updater"] button[data-action="plugin-check"][data-arg="dshmarket"]').click()`,
+        `document.querySelector('.panel[data-panel="plugins"] button[data-action="plugin-check"][data-arg="dshmarket"]').click()`,
       );
       await sleep(1200);
       const afterClick = await win.webContents.executeJavaScript(
@@ -327,7 +331,7 @@ async function runUiCheck({ shot }) {
     // offer 升级: pnpm would replace the link with a registry download.
     const groups = await win.webContents.executeJavaScript(
       `(() => {
-        const panel = document.querySelector('.panel[data-panel="updater"]');
+        const panel = document.querySelector('.panel[data-panel="plugins"]');
         if (panel === null) return null;
         const cards = [...panel.querySelectorAll('section.card')];
         const named = (prefix) => cards.find((card) => (card.querySelector('.card__title')?.textContent ?? '').startsWith(prefix));
@@ -346,10 +350,10 @@ async function runUiCheck({ shot }) {
       })()`,
     );
     if (groups === null) {
-      issues.push("无法读取插件更新面板的插件分组");
+      issues.push("无法读取插件管理面板的插件分组");
     } else {
-      if (groups.hasLocal !== true) issues.push("插件更新面板没有「本地插件」分组");
-      if (groups.hasRegistry !== true) issues.push("插件更新面板没有「联网插件」分组");
+      if (groups.hasLocal !== true) issues.push("插件管理面板没有「本地插件」分组");
+      if (groups.hasRegistry !== true) issues.push("插件管理面板没有「联网插件」分组");
       if (groups.localUpdates !== 0) {
         issues.push(`「本地插件」分组出现了 ${groups.localUpdates} 个升级按钮（会把 link 换成 registry 副本）`);
       }
@@ -402,7 +406,7 @@ async function runUiCheck({ shot }) {
   // Capture each panel that gained a one-click button (plus the overview
   // panel), so a ui-check run also leaves visual evidence for those screens.
   const extraShots = {};
-  for (const [panelId, suffix] of [["quick", "quick"], ["plugins", "plugins"], ["updater", "updater"], ["awesome", "awesome"], ["checkpoints", "checkpoints"], ["backup", "backup"], ["diagnostics", "diagnostics"]]) {
+  for (const [panelId, suffix] of [["quick", "quick"], ["plugins", "plugins"], ["awesome", "awesome"], ["checkpoints", "checkpoints"], ["backup", "backup"], ["diagnostics", "diagnostics"]]) {
     await win.webContents.executeJavaScript(`document.querySelector('[data-action="tab"][data-arg="${panelId}"]').click()`);
     await sleep(400);
     const file = shot.replace(/\.png$/i, `-${suffix}.png`);
