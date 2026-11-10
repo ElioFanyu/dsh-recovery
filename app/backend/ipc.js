@@ -48,9 +48,19 @@ function describeError(error) {
 }
 
 class RecoveryController {
-  constructor({ version, onState }) {
+  constructor({ version, onState, allowShell = true }) {
     this.version = version;
     this.onState = onState;
+    // Whether the console may actually hand a path or URL to the OS.
+    //
+    // `--verify` exercises 打开 actions (open-plugin / open-path) to prove they
+    // resolve the right target, and those call `shell.showItemInFolder()` /
+    // `shell.openPath()` — which pop a File Explorer window on the developer's
+    // desktop for every assertion. A self test must never do that, so headless
+    // runs construct the controller with `allowShell: false`: the actions still
+    // compute and return their result (that is what is asserted), they just do
+    // not touch the OS.
+    this.allowShell = allowShell !== false;
     this.config = { ...paths.loadConfig().value };
     this.selectedProfile = typeof this.config.profileName === "string" && this.config.profileName !== "" ? this.config.profileName : "desktop";
     this.lastAction = undefined;
@@ -608,13 +618,13 @@ class RecoveryController {
           // Deliberately outside assertOpenable(): this folder is the plugin's
           // own source, wherever it lives, and it is read from our own state
           // rather than from the renderer.
-          shell.showItemInFolder(folder);
+          if (this.allowShell) shell.showItemInFolder(folder);
           return { ok: true, result: { message: `已在文件管理器中定位 ${folder}`, opened: folder, kind: "folder" }, state: this.state };
         }
         if (typeof plugin.homepage !== "string" || !/^https?:\/\//iu.test(plugin.homepage)) {
           return { ok: false, error: `${name} 没有可打开的主页（package.json 里没有 homepage / repository）`, state: this.state };
         }
-        await shell.openExternal(plugin.homepage);
+        if (this.allowShell) await shell.openExternal(plugin.homepage);
         return { ok: true, result: { message: `已在浏览器中打开 ${plugin.homepage}`, opened: plugin.homepage, kind: "homepage" }, state: this.state };
       }
 
@@ -1585,6 +1595,10 @@ class RecoveryController {
 
   async openPath(target) {
     const resolved = this.assertOpenable(target);
+    // Validation still runs headlessly (that is what the tests assert); only the
+    // OS hand-off is skipped, so a `--verify` run does not litter the desktop
+    // with Explorer windows.
+    if (!this.allowShell) return { ok: true, state: this.state, result: { opened: resolved, suppressed: true } };
     if (isDirectory(resolved)) {
       const error = await shell.openPath(resolved);
       if (error !== "") return { ok: false, error, state: this.state };
@@ -1597,8 +1611,8 @@ class RecoveryController {
 
   showItem(target) {
     const resolved = this.assertOpenable(target);
-    shell.showItemInFolder(resolved);
-    return { ok: true, state: this.state, result: { revealed: resolved } };
+    if (this.allowShell) shell.showItemInFolder(resolved);
+    return { ok: true, state: this.state, result: { revealed: resolved, suppressed: this.allowShell !== true || undefined } };
   }
 }
 

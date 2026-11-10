@@ -739,6 +739,15 @@ async function verifyPluginManagement(controller, fixture, result) {
       String(openLocal.result?.opened).toLowerCase() === path.resolve(linkedTarget).toLowerCase(),
     errorText(openLocal) ?? openLocal.result?.opened,
   );
+  // The controller the self tests build has `allowShell: false`, so asserting
+  // here proves the resolution still happens while nothing is handed to the OS.
+  // (Without it, every `--verify` run opened File Explorer windows and left a
+  // trail of `verify-<timestamp>` folders on the desktop.)
+  result.ok(
+    "插件管理: 自检不会真的弹出资源管理器",
+    controller.allowShell === false,
+    `allowShell=${controller.allowShell}`,
+  );
   const openUnknown = await controller.dispatch("recovery:open-plugin", ["not-a-plugin"]);
   result.ok("插件管理: 未知插件名的「打开」被拒绝", openUnknown.ok === false, errorText(openUnknown));
   // A registry package with neither homepage nor repository must fail loudly
@@ -805,11 +814,10 @@ async function verifyPluginUpdater(controller, fixture, result) {
   fs.writeFileSync(runPath, JSON.stringify({ pid: 999998, grouped: false }));
 
   // The #935 shape: a bundle on disk whose row the host dropped on its way to
-  // refusing an update.
+  // refusing an update. The layer is emptied on purpose — that is the "disabled"
+  // state, and repair must leave it alone — then an unbacked row is added, which
+  // would stop the next boot from composing and IS repair's business.
   const dropped = readJson(manifestPath);
-  dropped.value.dsh.profile.bundles = [];
-  writeJsonAtomic(manifestPath, dropped.value);
-  // An unbacked row, which would stop the next boot from composing.
   dropped.value.dsh.profile.bundles = ["ghost-from-a-failed-install"];
   writeJsonAtomic(manifestPath, dropped.value);
 
@@ -830,8 +838,12 @@ async function verifyPluginUpdater(controller, fixture, result) {
     errorText(repaired),
   );
   result.ok(
-    "插件更新: 修复补回被丢掉的插件层条目",
-    repairedBundles.includes(FIXTURE_BUNDLE),
+    // This used to assert the opposite ("补回被丢掉的插件层条目"). Leaving a
+    // package out of `dsh.profile.bundles` is how a plugin is disabled while
+    // staying installed, so 修复插件状态 must not re-enable it — repairing
+    // breakage is not the same as overruling a choice.
+    "插件更新: 修复不擅自重新启用已禁用的插件",
+    !repairedBundles.includes(FIXTURE_BUNDLE),
     JSON.stringify(repairedBundles),
   );
   result.ok(
@@ -1543,7 +1555,10 @@ async function runVerify({ version, targets }) {
 
   const { RecoveryController } = require("./ipc");
   try {
-    const controller = new RecoveryController({ version });
+    // `allowShell: false` keeps every 打开 assertion from actually launching
+    // File Explorer. The actions still resolve and return their target, which is
+    // what these checks assert; only the OS hand-off is skipped.
+    const controller = new RecoveryController({ version, allowShell: false });
     // Point the controller at the fixture in memory only: nothing is persisted,
     // so the real config file keeps whatever the user selected.
     controller.config = {

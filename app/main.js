@@ -226,6 +226,49 @@ async function runUiCheck({ shot }) {
     // or the footer; that used to happen when a missing action was appended
     // with the native DOM append.
     if (/undefined/u.test(pluginsPanel.text)) issues.push("插件管理面板出现了 undefined 文字");
+
+    // 内置组件 must not be rendered as a group any more: they cannot be toggled
+    // or uninstalled, and they pushed actionable plugins below the fold. The
+    // headline keeps their count so nothing is silently hidden.
+    const builtinCard = await win.webContents.executeJavaScript(
+      `(() => {
+        const p = document.querySelector('.panel[data-panel="plugins"]');
+        if (p === null) return null;
+        const titles = [...p.querySelectorAll('section.card .card__title')].map((n) => n.textContent ?? '');
+        return { titles, text: p.innerText };
+      })()`,
+    );
+    if (builtinCard !== null) {
+      const builtinTitled = builtinCard.titles.filter((title) => title.startsWith("内置组件"));
+      if (builtinTitled.length > 0) issues.push(`插件管理：仍在渲染「内置组件」分组（${builtinTitled.join(", ")}）`);
+    }
+
+    // Within each group, disabled rows must sort last. Checked per card so a
+    // regression in either the local or the registry list is caught.
+    const ordering = await win.webContents.executeJavaScript(
+      `(() => {
+        const p = document.querySelector('.panel[data-panel="plugins"]');
+        if (p === null) return null;
+        const out = {};
+        for (const card of p.querySelectorAll('section.card')) {
+          const title = card.querySelector('.card__title')?.textContent ?? '';
+          if (!title.startsWith('本地插件') && !title.startsWith('联网插件')) continue;
+          const rows = [...card.querySelectorAll('.row.row--plugin')].map((row) => ({
+            enabled: (row.innerText ?? '').includes('已启用'),
+          }));
+          const firstOff = rows.findIndex((row) => row.enabled !== true);
+          const lastOn = rows.map((row) => row.enabled === true).lastIndexOf(true);
+          out[title.split('（')[0]] = { rows: rows.length, firstOff, lastOn };
+        }
+        return out;
+      })()`,
+    );
+    for (const [group, info] of Object.entries(ordering ?? {})) {
+      if (info.firstOff === -1) continue;
+      if (info.lastOn > info.firstOff) {
+        issues.push(`插件管理：${group} 里启用的插件排在了已禁用之后（首个禁用在第 ${info.firstOff + 1} 行，最后启用在第 ${info.lastOn + 1} 行）`);
+      }
+    }
   }
   const footerText = await win.webContents.executeJavaScript("document.getElementById('footer-actions')?.innerText ?? ''");
   if (/undefined/u.test(footerText)) issues.push(`页脚出现了 undefined 文字：${footerText.trim()}`);
@@ -647,7 +690,11 @@ function createWindow() {
 }
 
 const ready = (async () => {
-  controller = new RecoveryController({ version: app.getVersion(), onState: broadcast });
+  // `--verify` / `--self-check` must not hand anything to the OS: the 打开
+  // assertions would open a File Explorer window per check and leave a trail of
+  // `verify-<timestamp>` folders on the desktop. The actions still resolve and
+  // return their target, which is what the checks actually assert.
+  controller = new RecoveryController({ version: app.getVersion(), onState: broadcast, allowShell: headless !== true });
   const targetId = argvValue("--target=");
   const profileName = argvValue("--profile=");
   const dshHome = argvValue("--home=");

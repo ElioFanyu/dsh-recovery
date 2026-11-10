@@ -797,7 +797,13 @@ function inspectProfile(dir, options = {}) {
     }
     if (row.declared === undefined && row.version !== undefined) row.problems.push("磁盘上已安装，但没有写进 package.json");
     if (row.declared !== undefined && row.version === undefined) row.problems.push("package.json 里有声明，但 node_modules 里没有（重启后组不起来）");
-    if (row.bundle && !row.inBundles) row.problems.push("已安装为插件，但不在 dsh.profile.bundles 里（不会加载）");
+    // An installed plugin that is not in `dsh.profile.bundles` is DISABLED, not
+    // broken. Leaving a package out of the layer is the supported way to turn a
+    // plugin off while keeping it installed, so treating it as an inconsistency
+    // made the console cry wolf about a state the user chose on purpose — and
+    // 「修复插件状态」 would then helpfully re-enable it. Only the opposite
+    // direction (in the layer but declares no dsh.bundle) actually breaks
+    // composition.
     if (!row.bundle && row.inBundles && row.version !== undefined) row.problems.push("列在 dsh.profile.bundles 里，但没有声明 dsh.bundle（会让组合失败）");
     if (row.entryDeclared && row.entry === undefined) row.problems.push("声明了入口文件，但文件不存在（构建不完整）");
     if (row.patchMissing !== null) row.problems.push(row.patchMissing?.invalid ?? `补丁文件不存在: ${row.patchMissing.file}`);
@@ -952,11 +958,14 @@ function repair(dir, options = {}) {
     next.push(name);
   }
   for (const name of Object.keys(dependencies)) {
-    if (isBundle(installedManifest(dir, name)) && !next.includes(name)) {
-      lines.push({ level: "ok", text: `${name}: 已安装为插件但不在插件层 —— 已补回 dsh.profile.bundles` });
-      next.push(name);
-      bundlesChanged = true;
-    }
+    // Deliberately NOT re-added to `dsh.profile.bundles`.
+    //
+    // This used to say "已安装为插件但不在插件层 —— 已补回", on the theory that a
+    // missing layer entry was always host damage. It is not: leaving a package
+    // out of the layer is how a plugin gets disabled while staying installed,
+    // and 修复插件状态 is supposed to repair breakage, not overrule a choice.
+    // Silently re-enabling a plugin the user turned off is exactly the kind of
+    // "repair that changes what I configured" nobody wants.
   }
 
   if (bundlesChanged) {

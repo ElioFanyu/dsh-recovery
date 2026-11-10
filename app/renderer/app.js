@@ -731,7 +731,6 @@ function panel(id, nodes) {
 // --- panel: quick recovery ------------------------------------------------
 
 function renderQuick() {
-  const detail = state.selectedProfileDetail;
   const running = state.running.isRunning;
   const source = state.selected?.exe;
 
@@ -752,21 +751,9 @@ function renderQuick() {
           : button("显示临时目录", "show-item", state.safeModeHomes[state.safeModeHomes.length - 1].dir),
       ],
     }),
-    card({
-      icon: "⚙",
-      title: "插件管理",
-      desc: "安装或更新插件后出现问题？查看当前 Profile 的插件，禁用或卸载可能引发问题的第三方插件。",
-      body:
-        detail === undefined || detail.exists !== true
-          ? empty("Profile 目录不存在，无法读取插件。")
-          : metrics([
-              ["已启用的插件层", String(detail.bundles.length)],
-              ["已安装的组合包", String(detail.plugins.length)],
-              ["隔离区中的包", String(detail.removed.length)],
-              ["补丁条目", `${detail.patchEntries.length}（禁用 ${detail.patchDisabledCount}）`],
-            ]),
-      actions: [button("管理插件", "tab", "plugins", { className: "btn--primary" })],
-    }),
+    // The「插件管理」summary card that used to sit here is gone: it only
+    // repeated numbers the 插件管理 tab already shows in its own header, behind
+    // one extra click. Plugin work starts from the tab bar.
     card({
       icon: "⚡",
       title: "重置插件集",
@@ -970,6 +957,7 @@ function renderPlugins() {
   const nodes = [
     panelBar(
       `已启用 ${enabledCount} / ${bundles.length} 个插件 · 本地 ${localPlugins.length} · 联网 ${registryPlugins.length}` +
+        (builtinPlugins.length > 0 ? ` · 内置 ${builtinPlugins.length}（未列出）` : "") +
         (patchDisabledCount > 0 ? ` · 补丁层禁用 ${patchDisabledCount} 条` : "") +
         (problemCount > 0 ? ` · ${problemCount} 处需要处理` : ""),
       [
@@ -1096,45 +1084,56 @@ function renderPlugins() {
   }
 
   // --- the plugins themselves ---------------------------------------------
+  //
+  // 内置组件 are not shown. They ship inside the application, cannot be
+  // toggled or uninstalled, and every profile always has the same two — listing
+  // them pushed the plugins the user can actually act on below the fold.
+  // Their count stays in the summary bar so nothing looks hidden.
+  //
+  // Within each group, disabled rows sink to the bottom: the enabled ones are
+  // what the page is for, and a long list otherwise buries them among plugins
+  // the user already turned off.
+  const byEnabledThenName = (left, right) => {
+    const leftOff = left.enabled === true ? 0 : 1;
+    const rightOff = right.enabled === true ? 0 : 1;
+    if (leftOff !== rightOff) return leftOff - rightOff;
+    return left.name.localeCompare(right.name, "en");
+  };
+
   if (bundles.length === 0) {
     nodes.push(card({ title: "插件", desc: `Profile ${detail.name} · 清单 ${detail.manifestPath}`, body: empty("这个 Profile 还没有启用任何插件。") }));
   }
 
   if (localPlugins.length > 0) {
+    const sorted = [...localPlugins].sort(byEnabledThenName);
+    const offCountLocal = sorted.filter((plugin) => plugin.enabled !== true).length;
     nodes.push(
       card({
         title: `本地插件（${localPlugins.length}）`,
         icon: "📁",
-        desc: "用 link: / 符号链接指向本机工作副本的插件，代码在它自己的文件夹里。「打开文件夹」定位到那本目录，改代码立即生效。这里不提供升级 —— pnpm 升级会把这个链接换成 registry 下载的副本，你的工作副本就被断开了。",
+        desc:
+          "用 link: / 符号链接指向本机工作副本的插件，代码在它自己的文件夹里。「打开文件夹」定位到那本目录，改代码立即生效。这里不提供升级 —— pnpm 升级会把这个链接换成 registry 下载的副本，你的工作副本就被断开了。" +
+          (offCountLocal > 0 ? ` 已禁用的 ${offCountLocal} 个排在最后。` : ""),
         tags: [chip(`${localPlugins.length} 个`, "ok")],
-        body: list(localPlugins.map((plugin) => pluginRow(plugin, updaterByName.get(plugin.name), running))),
+        body: list(sorted.map((plugin) => pluginRow(plugin, updaterByName.get(plugin.name), running))),
       }),
     );
   }
 
   if (registryPlugins.length > 0) {
+    const sorted = [...registryPlugins].sort(byEnabledThenName);
     const noHome = registryPlugins.filter((plugin) => typeof plugin.homepage !== "string").length;
+    const offCountRegistry = sorted.filter((plugin) => plugin.enabled !== true).length;
     nodes.push(
       card({
         title: `联网插件（${registryPlugins.length}）`,
         icon: "🌐",
         desc:
           `从 npm 安装进 Profile 的插件：「打开官网」打开项目主页，「升级」用 pnpm 重新解析最新版本（包括固定版本号的那些），装完再校验入口文件与插件层条目。${registryPlugins.length} 个` +
-          (noHome > 0 ? `，其中 ${noHome} 个没有声明 homepage / repository，无法打开主页。` : "。"),
+          (noHome > 0 ? `，其中 ${noHome} 个没有声明 homepage / repository，无法打开主页` : "") +
+          (offCountRegistry > 0 ? `；已禁用的 ${offCountRegistry} 个排在最后。` : "。"),
         tags: [chip(`${registryPlugins.length} 个`)],
-        body: list(registryPlugins.map((plugin) => pluginRow(plugin, updaterByName.get(plugin.name), running))),
-      }),
-    );
-  }
-
-  if (builtinPlugins.length > 0) {
-    nodes.push(
-      card({
-        title: `内置组件（${builtinPlugins.length}）`,
-        icon: "🧩",
-        desc: "随应用一起发布的组件，不能禁用也不能卸载；「打开文件夹」定位到 Profile 内的安装副本。",
-        tags: [chip(`${builtinPlugins.length} 个`, "muted")],
-        body: list(builtinPlugins.map((plugin) => pluginRow(plugin, updaterByName.get(plugin.name), running))),
+        body: list(sorted.map((plugin) => pluginRow(plugin, updaterByName.get(plugin.name), running))),
       }),
     );
   }
