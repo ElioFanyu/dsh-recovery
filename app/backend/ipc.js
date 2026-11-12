@@ -25,6 +25,8 @@ const updater = require("./plugin-updater");
 const awesome = require("./awesome");
 const backup = require("./backup");
 const cookies = require("./cookies");
+const registry = require("./registry");
+const selfUpdate = require("./self-update");
 
 function isWithin(parent, child) {
   const relative = path.relative(parent, child);
@@ -45,6 +47,25 @@ function cookiesBackupsDir() {
 function describeError(error) {
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+/**
+ * Size of the tracked source under `root`, memoised for the session.
+ *
+ * Walking the tree on every `gather()` would be a syscall storm on every click;
+ * the checkout only changes when an update lands, and that path resets the memo.
+ */
+let checkoutSizeCache;
+function checkoutSizeFor(root) {
+  if (typeof root !== "string" || root === "") return undefined;
+  if (checkoutSizeCache !== undefined && checkoutSizeCache.root === root) return checkoutSizeCache.label;
+  try {
+    const measured = selfUpdate.checkoutSize(root);
+    checkoutSizeCache = { root, label: measured.label };
+    return measured.label;
+  } catch {
+    return undefined;
+  }
 }
 
 class RecoveryController {
@@ -76,6 +97,11 @@ class RecoveryController {
     this.pendingRestore = undefined;
     // Outcome of the last restore, for the panel's summary card.
     this.lastRestore = undefined;
+    // Last "does a newer console exist?" answer. Cached because the check hits
+    // the network; `gather()` only ever reads this.
+    this.lastSelfUpdateCheck = undefined;
+    // Last npm registry scan of the installed plugins. Also cached.
+    this.lastPluginVersions = undefined;
   }
 
   // -- persistence ---------------------------------------------------------
@@ -196,6 +222,12 @@ class RecoveryController {
       // `dsh-auth-*` entries accumulate once per random port for 30 days.
       // Read-only; cleanup is the `recovery:cookies-clear` channel.
       cookies: this.summarizeCookies(),
+      // 恢复器自身: whether this checkout can update, and what the last check
+      // found. The check itself is a channel (it hits the network), so this is
+      // only the cached answer — `gather` must stay offline-fast.
+      selfUpdate: this.selfUpdateSummary(),
+      // 插件更新: the last registry scan. Also cached; scanning is a channel.
+      pluginVersions: this.pluginVersionsSummary(),
       lastAction: this.lastAction,
       busy: this.busy,
     };
@@ -482,8 +514,60 @@ class RecoveryController {
     }, { sizes: true });
   }
 
-  async autoCheckpoint(label) {
+  /**
+   * What this copy knows about updating itself, without touching the network.
+   *
+   * `gather()` runs on every render, so it must never be the thing that opens a
+   * socket: the summary is the cached verdict of the last explicit check, plus
+   * the static facts (can this checkout update at all, what version is running).
+   */
+  selfUpdateSummary() {
+    let info;
     try {
+      info = selfUpdate.inspect();
+    } catch (error) {
+      info = { available: false, reason: describeError(error), version: this.version };
+    }
+    return {
+      version: info.version ?? this.version,
+      root: info.root,
+      available: info.available === true,
+      reason: info.reason,
+      lastCheck: this.lastSelfUpdateCheck,
+      sizeLabel: checkoutSizeFor(info.root),
+    };
+  }
+
+  /**
+   * Registry scan results for the profile's installed plugins.
+   *
+   * Cached for the same reason: `gather()` cannot issue HTTP requests. The first
+   * call returns the empty shape so the panel renders a "还没检查" state instead
+   * of undefined.
+   */
+  pluginVersionsSummary() {
+    return (
+      this.lastPluginVersions ?? {
+        registry: undefined,
+        checked: 0,
+        rows: [],
+        outdated: [],
+        failed: [],
+        hasUpdates: false,
+        checkedAt: undefined,
+      }
+    );
+  }
+
+  /** Packages a one-click upgrade would touch: registry plugins that are installed. */
+  upgradablePluginNames() {
+    const rows = this.state?.pluginUpdater?.rows ?? [];
+    return rows
+      .filter((row) => row.origin !== "local" && row.version !== undefined && row.declared !== undefined)
+      .map((row) => row.name);
+  }
+
+  async autoCheckpoint(label) {    try {
       const created = checkpoints.createCheckpoint({
         home: this.state.home.path,
         profileName: this.requireProfileName(),
@@ -655,6 +739,38 @@ class RecoveryController {
 
       case "recovery:cookies-restore":
         return this.restoreCookieBackup(String(args[0] ?? ""));
+
+      // -- 恢复器自身更新 ----------------------------------------------------
+      //
+      // The console runs straight out of a git working copy (`.runtime/resources/
+      // app` is a junction into it), so updating it means fast-forwarding that
+      // copy — not swapping a package. Checking is read-only; applying only ever
+      // does `merge --ff-only`, and refuses a dirty tree.
+      case "recovery:self-update-check": {
+        const checked = await selfUpdate.check();
+        this.lastSelfUpdateCheck = checked;
+        if (checked.ok !== true) {
+          return { ok: false, error: checked.error, result: { check: checked }, state: this.state };
+        }
+        const message = checked.hasUpdate
+          ? `发现新版本${checked.upstreamVersion === undefined ? "" : ` v${checked.upstreamVersion}`}（落后 ${checked.behind} 个提交）`
+          : "已经是最新版本";
+        this.record(true, message, { behind: checked.behind });
+        return { ok: true, result: { message, check: checked }, state: await this.refresh({ sizes: false }) };
+      }
+
+      case "recovery:self-update-apply": {
+        const applied = await selfUpdate.apply();
+        this.lastSelfUpdateCheck = applied.check;
+        if (applied.ok !== true) {
+          return { ok: false, error: applied.error, result: { apply: applied }, state: this.state };
+        }
+        // The checkout just changed under us; the memoised size is stale.
+        checkoutSizeCache = undefined;
+        const message = applied.needsRestart === true ? `${applied.message} 请退出并重新启动恢复器。` : applied.message;
+        this.record(true, message, applied);
+        return { ok: true, result: { message, apply: applied }, state: await this.refresh({ sizes: false }) };
+      }
 
       // -- 环境备份 ---------------------------------------------------------
       //
@@ -849,6 +965,51 @@ class RecoveryController {
         });
         this.record(outcome.ok, outcome.message, outcome);
         return { ok: outcome.ok, result: { message: outcome.message, updater: outcome }, state: this.state };
+      }
+
+      // Ask the registry which installed plugins have a newer published version.
+      //
+      // Read-only and safe while the app runs (it only makes HTTP requests), and
+      // deliberately NOT behind `perform`: no checkpoint, no idle requirement, no
+      // mutation. What it does touch is a cached summary, so the panel keeps the
+      // answer across re-renders.
+      case "recovery:plugin-version-check": {
+        try {
+          const dir = this.requireUpdaterDir();
+          const names = (this.state?.pluginUpdater?.rows ?? [])
+            .filter((row) => row.origin !== "local" && row.version !== undefined && row.declared !== undefined)
+            .map((row) => ({ name: row.name, version: row.version }));
+          if (names.length === 0) {
+            this.lastPluginVersions = { registry: undefined, checked: 0, rows: [], outdated: [], failed: [], hasUpdates: false, checkedAt: new Date().toISOString() };
+            return { ok: true, result: { message: "没有可从 npm 检查的联网插件", versions: this.lastPluginVersions }, state: this.state };
+          }
+          const versions = await registry.checkVersions(names, { registry: registry.registryFor(dir) });
+          this.lastPluginVersions = versions;
+          const message =
+            versions.outdated.length === 0
+              ? `已检查 ${versions.checked} 个联网插件，都是最新版本`
+              : `已检查 ${versions.checked} 个联网插件，${versions.outdated.length} 个有更新`;
+          this.record(true, message, { outdated: versions.outdated.map((row) => row.name) });
+          return { ok: true, result: { message, versions }, state: await this.refresh({ sizes: false }) };
+        } catch (error) {
+          return { ok: false, error: `检查更新失败：${describeError(error)}`, state: this.state };
+        }
+      }
+
+      // Upgrade every registry plugin that has an update pending.
+      //
+      // Sequential inside `updateMany`, and each package's outcome is kept, so one
+      // failure cannot hide the others. `perform` still wraps the whole batch:
+      // it takes the checkpoint and holds the concurrency lock.
+      case "recovery:plugin-update-all": {
+        const names = args[0] !== null && typeof args[0] === "object" && Array.isArray(args[0].names)
+          ? args[0].names.map((value) => String(value))
+          : this.upgradablePluginNames();
+        if (names.length === 0) {
+          return { ok: true, result: { message: "没有可升级的联网插件", skipped: true }, state: this.state };
+        }
+        return this.runUpdater("一键升级全部插件", "一键升级全部插件", (dir, installDir) =>
+          updater.updateMany(dir, names, { installDir }), { needsPnpm: true });
       }
 
       case "recovery:awesome-set-dir": {

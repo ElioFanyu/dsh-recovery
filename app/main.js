@@ -63,6 +63,10 @@ const CHANNELS = [
   "recovery:plugin-install-market",
   "recovery:plugin-update",
   "recovery:plugin-check",
+  "recovery:plugin-version-check",
+  "recovery:plugin-update-all",
+  "recovery:self-update-check",
+  "recovery:self-update-apply",
   "recovery:open-external",
   "recovery:awesome-choose-dir",
   "recovery:awesome-set-dir",
@@ -481,19 +485,42 @@ async function runUiCheck({ shot }) {
     }
   }
 
+  // 插件管理 must offer a registry check and a one-click upgrade. Both are new
+  // entry points, so a refactor that drops them would otherwise pass.
+  if (pluginsPanel !== null) {
+    for (const action of ["plugin-version-check", "plugin-update-all"]) {
+      if (!pluginsPanel.actions.some((button) => button.action === action)) issues.push(`插件管理面板缺少按钮 ${action}`);
+    }
+    // 一键升级 must stay disabled until a scan says something is pending: an
+    // enabled button with nothing to do would run pnpm over every plugin.
+    const updateAll = pluginsPanel.actions.find((button) => button.action === "plugin-update-all");
+    const hasOutdated = /\d+ 个待升级/u.test(pluginsPanel.text) || /一键升级（\d+）/u.test(pluginsPanel.text);
+    if (updateAll !== undefined && hasOutdated !== true && updateAll.disabled !== true) {
+      issues.push("插件管理：没有检测到更新时「一键升级」仍可点击");
+    }
+    if (!pluginsPanel.text.includes("插件更新")) issues.push("插件管理面板缺少「插件更新」区域");
+  }
+
   // Pointing the console at an install that auto-detection missed must be
   // reachable from the diagnostics panel even when only one install is known.
   const diagnosticsPanel = await win.webContents.executeJavaScript(`${panelProbe}("diagnostics")`);
   if (diagnosticsPanel === null) issues.push("找不到「诊断」面板");
   else {
-    for (const action of ["choose-target", "choose-target-exe"]) {
+    for (const action of ["choose-target", "choose-target-exe", "self-update-check", "self-update-apply"]) {
       if (!diagnosticsPanel.actions.some((button) => button.action === action)) issues.push(`诊断面板缺少按钮 ${action}`);
+    }
+    if (!diagnosticsPanel.text.includes("更新恢复器")) issues.push("诊断面板缺少「更新恢复器」卡片");
+    // 立即更新 must be disabled until a check says there is something to apply.
+    const applyButton = diagnosticsPanel.actions.find((button) => button.action === "self-update-apply");
+    const knownUpdate = /任务|有新版本|落后远端/u.test(diagnosticsPanel.text);
+    if (applyButton !== undefined && applyButton.disabled !== true && knownUpdate !== true) {
+      issues.push("更新恢复器：「立即更新」在还没检查就绪时可点击");
     }
   }
 
   // 残留 cookie 卡片在「快速恢复」的最下方，滚动后的整页截图看不到它，
   // 所以单独把它滚进视野再拍一张，作为这次新增功能的可视证据。
-  await win.webContents.executeJavaScript('document.querySelector(\'[data-action="tab"][data-arg="quick"]\').click()');
+  await win.webContents.executeJavaScript(`document.querySelector('[data-action="tab"][data-arg="quick"]').click()`);
   await sleep(400);
   {
     const cookieCardFound = await win.webContents.executeJavaScript(`(() => {
@@ -505,7 +532,24 @@ async function runUiCheck({ shot }) {
     })()`);
     if (cookieCardFound !== true) issues.push("快速恢复面板里找不到「残留的登录 cookie」卡片");
     await sleep(500);
-    fs.writeFileSync(shot.replace(/\\.png$/i, "-cookie-card.png"), (await win.webContents.capturePage()).toPNG());
+    fs.writeFileSync(shot.replace(/\.png$/i, "-cookie-card.png"), (await win.webContents.capturePage()).toPNG());
+  }
+
+  // Same reason as above: 「更新恢复器」 sits at the bottom of 诊断, so a
+  // whole-page shot cuts it off. Scrolling to it also proves it renders.
+  await win.webContents.executeJavaScript(`document.querySelector('[data-action="tab"][data-arg="diagnostics"]').click()`);
+  await sleep(400);
+  {
+    const selfUpdateFound = await win.webContents.executeJavaScript(`(() => {
+      const cards = [...document.querySelectorAll('.panel[data-panel="diagnostics"] section.card')];
+      const target = cards.find((c) => (c.querySelector('.card__title')?.textContent ?? '').includes('更新恢复器'));
+      if (target === undefined) return false;
+      target.scrollIntoView({ block: 'start' });
+      return true;
+    })()`);
+    if (selfUpdateFound !== true) issues.push("诊断面板里找不到「更新恢复器」卡片");
+    await sleep(500);
+    fs.writeFileSync(shot.replace(/\.png$/i, "-self-update.png"), (await win.webContents.capturePage()).toPNG());
   }
 
   await win.webContents.executeJavaScript("document.querySelector('[data-action=\"tab\"][data-arg=\"restart\"]').click()");

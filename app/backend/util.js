@@ -163,11 +163,49 @@ function removeEntry(target) {
       fs.rmdirSync(target);
     }
   } else if (stat.isDirectory()) {
-    fs.rmSync(target, { recursive: true, force: true });
+    try {
+      fs.rmSync(target, { recursive: true, force: true });
+    } catch (error) {
+      // `force: true` suppresses ENOENT, not EPERM. Git writes its object files
+      // read-only (`.git/objects/**` is 0444), and Windows refuses to unlink a
+      // read-only file — so a throwaway git repo could not be deleted at all.
+      // Clear the flag on everything beneath and try once more.
+      if (error.code !== "EPERM" && error.code !== "EACCES") throw error;
+      clearReadOnly(target);
+      fs.rmSync(target, { recursive: true, force: true });
+    }
   } else {
     fs.rmSync(target, { force: true });
   }
   return true;
+}
+
+/** Best-effort: make every file under `dir` writable so it can be unlinked. */
+function clearReadOnly(dir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    try {
+      // Never follow a link/junction: chmod on the target would change the
+      // user's own working copy, which is exactly what removeEntry exists to
+      // avoid.
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        clearReadOnly(full);
+        continue;
+      }
+      const mode = fs.statSync(full).mode;
+      // 0o200 = owner write.
+      if ((mode & 0o200) === 0) fs.chmodSync(full, mode | 0o200);
+    } catch {
+      /* keep going: one stubborn file must not stop the rest */
+    }
+  }
 }
 
 function uniquePath(base) {

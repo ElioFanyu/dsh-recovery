@@ -58,6 +58,12 @@ contextBridge.exposeInMainWorld("recovery", {
   pluginInstallMarket: (dryRun) => invoke("recovery:plugin-install-market", dryRun === true),
   pluginUpdate: (spec, dryRun) => invoke("recovery:plugin-update", spec, dryRun === true),
   pluginCheck: (name) => invoke("recovery:plugin-check", name),
+  pluginVersionCheck: () => invoke("recovery:plugin-version-check"),
+  pluginUpdateAll: (options) => invoke("recovery:plugin-update-all", options),
+
+  // --- 恢复器自身更新 -----------------------------------------------------
+  selfUpdateCheck: () => invoke("recovery:self-update-check"),
+  selfUpdateApply: () => invoke("recovery:self-update-apply"),
 
   // --- 收录插件 (awesome-dsh-plugin submission) ---------------------------
   openExternal: (url) => invoke("recovery:open-external", url),

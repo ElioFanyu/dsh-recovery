@@ -1128,6 +1128,87 @@ async function update(dir, spec, options = {}) {
   return { ok: verdict.ok, name, from: current, to: installed, lines: [...lines, ...verdict.lines], message: verdict.message };
 }
 
+/**
+ * Upgrade several registry plugins, one after another.
+ *
+ * Sequential on purpose: every upgrade runs `pnpm add`, and two pnpm processes
+ * against one profile fight over the same lockfile and `node_modules`. The
+ * updater's own concurrency guard exists for exactly this, so batching must not
+ * try to be clever.
+ *
+ * A failure must NOT abort the batch. One broken package (unpublished, blocked by
+ * a supply-chain policy, network blip) says nothing about the next one, and
+ * stopping halfway leaves the user with a partly-updated profile and no record
+ * of which is which. Every package gets its own outcome line; the caller renders
+ * them as a list.
+ *
+ * Local plugins are refused individually, not filtered out silently: the panel
+ * should be able to explain why a plugin was skipped.
+ */
+async function updateMany(dir, names, options = {}) {
+  const installDir = options.installDir;
+  const list = Array.isArray(names) ? names.filter((name) => typeof name === "string" && name.trim() !== "") : [];
+  const results = [];
+  let updated = 0;
+  let unchanged = 0;
+  let failed = 0;
+  let skipped = 0;
+
+  for (const raw of list) {
+    const name = registryNameOf(raw);
+    try {
+      const dependency = readJson(profileManifestPath(dir)).dependencies?.[name];
+      if (originOf(dir, name, dependency) === "local") {
+        skipped += 1;
+        results.push({ name, ok: false, skipped: true, reason: "本地插件（link: / 符号链接），升级会断开工作副本" });
+        continue;
+      }
+      if (installedVersion(dir, name) === undefined) {
+        skipped += 1;
+        results.push({ name, ok: false, skipped: true, reason: "没有安装在这个 profile 里" });
+        continue;
+      }
+      const outcome = await update(dir, name, { installDir });
+      if (outcome.from !== undefined && outcome.to !== undefined && outcome.from !== outcome.to) updated += 1;
+      else unchanged += 1;
+      results.push({
+        name,
+        ok: outcome.ok === true,
+        from: outcome.from,
+        to: outcome.to,
+        changed: outcome.from !== outcome.to,
+        message: outcome.message,
+      });
+    } catch (error) {
+      failed += 1;
+      results.push({ name, ok: false, failed: true, reason: error?.message ?? String(error) });
+    }
+  }
+
+  const parts = [];
+  if (updated > 0) parts.push(`${updated} 个已升级`);
+  if (unchanged > 0) parts.push(`${unchanged} 个本来就是最新`);
+  if (skipped > 0) parts.push(`${skipped} 个已跳过`);
+  if (failed > 0) parts.push(`${failed} 个失败`);
+  const lines = results.map((entry) => {
+    if (entry.failed === true) return { level: "bad", text: `${entry.name}: 失败 —— ${entry.reason}` };
+    if (entry.skipped === true) return { level: "warn", text: `${entry.name}: 已跳过 —— ${entry.reason}` };
+    if (entry.changed === false) return { level: "info", text: `${entry.name}: 已是 ${entry.from ?? entry.to}` };
+    return { level: entry.ok === true ? "ok" : "bad", text: `${entry.name}: ${entry.from} → ${entry.to}` };
+  });
+  return {
+    ok: failed === 0,
+    tried: list.length,
+    updated,
+    unchanged,
+    failed,
+    skipped,
+    results,
+    lines,
+    message: parts.length === 0 ? "没有需要升级的插件" : `一键升级：${parts.join("，")}`,
+  };
+}
+
 function check(dir, name, options = {}) {
   const manifest = readJson(profileManifestPath(dir));
   const onDisk = installedManifest(dir, name);
@@ -1211,6 +1292,7 @@ module.exports = {
   summarize,
   updateRisks,
   update,
+  updateMany,
   // Exposed for `--verify`: the stall/timeout behaviour is the whole point of
   // the runner process, and it is not reachable through the public commands
   // without a package manager and network.

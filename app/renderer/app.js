@@ -520,6 +520,49 @@ const ACTIONS = {
     await run(`升级 ${arg}`, "pluginUpdate", arg, false);
   },
   "plugin-check": (arg) => run(`检查 ${arg}`, "pluginCheck", arg),
+  // Ask npm which installed plugins have a newer published version. Read-only:
+  // no checkpoint, no restart, safe while DSH is running.
+  "plugin-version-check": () => run("正在检查插件更新", "pluginVersionCheck"),
+  "plugin-update-all": async () => {
+    const running = state.running.isRunning;
+    if (running) return;
+    const versions = state.pluginVersions;
+    const outdated = versions?.outdated ?? [];
+    const targets = outdated.length > 0 ? outdated : (state.pluginUpdater?.rows ?? []).filter((row) => row.origin !== "local" && row.version !== undefined);
+    if (targets.length === 0) {
+      toast("没有可升级的联网插件", "ok");
+      return;
+    }
+    const names = targets.map((entry) => entry.name);
+    if (
+      !confirm(
+        `一键升级 ${names.length} 个联网插件？\n\n` +
+          names.map((name) => `· ${name}`).join("\n") +
+          "\n\n· 逐个用 pnpm 升级，一个失败不会中断其余的\n" +
+          "· 本地插件（link:）会自动跳过，升级会断开你的工作副本\n" +
+          "· 执行前会自动创建检查点，可随时回滚\n" +
+          "· 全部串行执行，插件多时可能需要几分钟\n\n确定继续吗？",
+      )
+    )
+      return;
+    await run("正在升级全部插件", "pluginUpdateAll", { names });
+  },
+  "self-update-check": () => run("正在检查更新", "selfUpdateCheck"),
+  "self-update-apply": async () => {
+    const info = state.selfUpdate?.lastCheck;
+    const behind = info?.behind ?? 0;
+    if (
+      !confirm(
+        "更新恢复器到最新版本？\n\n" +
+          (behind > 0 ? `· 落后远端 ${behind} 个提交\n` : "") +
+          (info?.upstreamVersion === undefined ? "" : `· 远端版本 v${info.upstreamVersion}（当前 v${state.selfUpdate?.version ?? "?"}）\n`) +
+          "· 只做快进合并：有未提交的改动、或本地有自己的提交时会拒绝执行\n" +
+          "· 更新完成后需要退出并重新启动恢复器\n\n确定继续吗？",
+      )
+    )
+      return;
+    await run("正在更新恢复器", "selfUpdateApply");
+  },
 
   // --- 收录插件 ----------------------------------------------------------
   "awesome-choose-repo": () => run("选择插件仓库目录", "awesomeChooseDir", "repo"),
@@ -900,6 +943,88 @@ function cookieCard(running) {
   });
 }
 
+/**
+ * Which installed plugins have a newer version on the registry.
+ *
+ * Three distinct states have to be told apart, because "0 个有更新" means
+ * something different in each:
+ *
+ *   * never scanned   → "还没检查", with the button that scans;
+ *   * scanned, clean  → "都是最新版本", with the time it was checked;
+ *   * scanned, behind → the list, each row showing the exact version jump.
+ *
+ * Packages the registry could not answer for (network, unpublished name, a
+ * mirror that does not have it) are listed separately instead of being counted
+ * as "no update" — silently turning a failure into "up to date" is the one
+ * mistake this card must not make.
+ */
+function versionsCard(versions, { running, outdatedCount, scanned }) {
+  if (versions === undefined) {
+    return card({
+      icon: "⬆",
+      title: "插件更新",
+      desc: "还没检查过 registry。点上面的「检测更新」向 npm 查询每个联网插件的最新发布版本。",
+      body: empty("尚未检查。"),
+    });
+  }
+  if (scanned !== true) {
+    return card({
+      icon: "⬆",
+      title: "插件更新",
+      desc: "还没检查过 registry。点上面的「检测更新」向 npm 查询每个联网插件的最新发布版本（只读，不需要停止应用）。",
+    });
+  }
+
+  const outdated = versions.outdated ?? [];
+  const failed = versions.failed ?? [];
+  const rows = outdated.map((row) =>
+    row({
+      name: row.name,
+      mono: true,
+      sub: joinSub(`${row.installed} → ${row.latest}`, row.deprecated === undefined ? undefined : `已废弃：${row.deprecated}`),
+      side: [chip(`+${row.latest}`, "warn"), button("升级这一个", "plugin-update", row.name, { className: "btn--ghost", disabled: running })],
+    }),
+  );
+  // Installed copies NEWER than the registry's `latest` are reported, not
+  // upgraded: that only happens for a link, a dist-tag or a fork, and "updating"
+  // would move the user backwards.
+  const ahead = (versions.rows ?? []).filter((row) => row.ok === true && row.behind === true);
+
+  return card({
+    icon: "⬆",
+    title: `插件更新（${outdatedCount} 个有新版${failed.length > 0 ? ` · ${failed.length} 个查不到` : ""}）`,
+    desc:
+      (outdatedCount === 0
+        ? `已检查 ${versions.checked} 个联网插件，都是最新版本。`
+        : `已检查 ${versions.checked} 个联网插件，${outdatedCount} 个有更新的版本。可以逐个升级，或用上面的「一键升级」。`) +
+      (versions.checkedAt === undefined ? "" : ` 检查时间：${new Date(versions.checkedAt).toLocaleString("zh-CN")}。`) +
+      (versions.registry === undefined ? "" : ` registry：${versions.registry}。`),
+    tags: outdatedCount === 0 ? [chip("已是最新", "ok")] : [chip(`${outdatedCount} 个待升级`, "warn")],
+    body: [
+      rows.length === 0 ? undefined : list(rows),
+      failed.length === 0
+        ? undefined
+        : card({
+            title: "查不到版本的插件",
+            desc: "registry 没有返回这些包的信息（可能是网络问题、私有包，或用了不同的 registry）。它们不会被计入「已是最新」。",
+            body: list(
+              failed.map((row) =>
+                row({
+                  name: row.name,
+                  mono: true,
+                  muted: true,
+                  sub: joinSub(row.installed, row.error),
+                }),
+              ),
+            ),
+          }),
+      ahead.length === 0
+        ? undefined
+        : hint(`另外 ${ahead.length} 个插件本机版本比 registry 的 latest 还新（${ahead.map((row) => `${row.name} ${row.installed}`).join("、")}）。这通常是本地工作副本或 dist-tag，不会参与升级。`),
+    ],
+  });
+}
+
 // --- panel: plugins (management + updates on one page) --------------------
 
 /**
@@ -954,6 +1079,18 @@ function renderPlugins() {
   const risks = info?.risks ?? [];
   const problemCount = stuck.length + stale.length + inconsistent.length;
 
+  // Registry-update state. `pluginVersions` is the cached result of the last
+  // scan (the backend never scans inside `gather()` because that would open a
+  // socket on every render), so an unscanned profile reports "还没检查".
+  const versions = state.pluginVersions;
+  const outdatedRows = versions?.outdated ?? [];
+  const outdatedCount = outdatedRows.length;
+  const scanned = versions?.checkedAt !== undefined;
+  const checkingVersions = busy && busyLabel.includes("检查插件更新");
+  const upgradingAll = busy && busyLabel.includes("升级全部");
+  const versionCheckLabel = checkingVersions ? "正在检查…" : scanned ? "重新检测更新" : "检测更新";
+  const updateAllLabel = upgradingAll ? "正在升级…" : outdatedCount > 0 ? `一键升级（${outdatedCount}）` : "一键升级";
+
   const nodes = [
     panelBar(
       `已启用 ${enabledCount} / ${bundles.length} 个插件 · 本地 ${localPlugins.length} · 联网 ${registryPlugins.length}` +
@@ -983,6 +1120,20 @@ function renderPlugins() {
         button("预览修复内容", "plugin-repair-preview", undefined, {
           className: "btn--ghost",
           disabled: updaterReady !== true,
+        }),
+        button(versionCheckLabel, "plugin-version-check", undefined, {
+          className: "btn--ghost",
+          disabled: checkingVersions,
+          title: "向 npm registry 查询每个联网插件的最新发布版本（只读，不需要停止应用）",
+        }),
+        button(updateAllLabel, "plugin-update-all", undefined, {
+          className: outdatedCount > 0 ? "btn--primary" : undefined,
+          disabled: running || updaterReady !== true || upgradingAll,
+          title: running
+            ? "目标应用正在运行，请先停止"
+            : outdatedCount === 0
+              ? "还没有可升级的插件：先点「检测更新」"
+              : `逐个升级这 ${outdatedCount} 个有更新的联网插件`,
         }),
         button("刷新", "refresh", undefined, { className: "btn--ghost" }),
       ],
@@ -1183,6 +1334,14 @@ function renderPlugins() {
         ),
       }),
     );
+  }
+
+  // --- registry versions: which plugins have something newer --------------
+  // The list is what 「一键升级」 acts on, so it is shown as its own card rather
+  // than folded into each row: the point is to see, at a glance, how many
+  // upgrades are pending and what they would bump.
+  if (updaterReady) {
+    nodes.push(versionsCard(versions, { running, outdatedCount, scanned }));
   }
 
   // --- the market itself: install it, or update it -------------------------
@@ -2235,6 +2394,7 @@ function renderDiagnostics() {
         button("打开数据目录", "open-path", state.home.path),
       ],
     }),
+    selfUpdateCard(),
     card({
       title: "运行环境",
       body: metrics([
@@ -2249,6 +2409,105 @@ function renderDiagnostics() {
       ]),
     }),
   ];
+}
+
+/**
+ * Updating the console itself.
+ *
+ * The console runs out of a git working copy (`.runtime/resources/app` is a
+ * junction into it) and has no build step, so "update" is a fast-forward of that
+ * copy — see backend/self-update.js. The card says which of the two situations
+ * applies before offering a button: a copy without `.git` (someone unzipped it)
+ * cannot self-update at all, and pretending otherwise would just produce a
+ * confusing failure.
+ */
+function selfUpdateCard() {
+  const info = state.selfUpdate;
+  if (info === undefined) {
+    return card({ title: "更新恢复器", desc: "状态里没有恢复器更新信息。" });
+  }
+  const check = info.lastCheck;
+  if (info.available !== true) {
+    return card({
+      icon: "🔄",
+      title: "更新恢复器",
+      desc:
+        info.reason ??
+        "这不是一份 git 工作副本，无法自动更新。请重新克隆仓库，或用新版覆盖。",
+      tags: [chip(`v${info.version ?? "?"}`, "mono")],
+      body: metrics([["恢复器目录", info.root, true]]),
+    });
+  }
+
+  const behind = check?.behind ?? 0;
+  const dirty = check?.dirty === true;
+  let headline;
+  if (check === undefined) headline = "还没检查过更新";
+  else if (check.ok !== true) headline = "检查失败（见下方原因）";
+  else if (check.hasUpdate === true) headline = `有新版本：落后远端 ${behind} 个提交`;
+  else headline = "已经是最新版本";
+
+  const body = [];
+  if (check?.ok === true && Array.isArray(check.commits) && check.commits.length > 0) {
+    body.push(
+      card({
+        title: `远端新增的提交（${check.commits.length}）`,
+        desc: "这些就是更新会带进来的改动。",
+        body: list(check.commits.slice(0, 30).map((line) => row({ name: line, mono: true }))),
+      }),
+    );
+  }
+  if (dirty) {
+    body.push(
+      hint(
+        `工作区有 ${check.dirtyFiles} 个未提交的改动，自动更新会拒绝执行 —— 快进合并会和你本地的修改冲突。请先提交或撤销这些改动。`,
+      ),
+    );
+  }
+  if (check?.ok === false) body.push(hint(`无法检查更新：${check.error ?? "未知原因"}`));
+
+  return card({
+    icon: "🔄",
+    title: "更新恢复器",
+    desc:
+      "恢复器直接从这个 git 工作副本运行（.runtime/resources/app 是指向它的目录联接），没有打包安装包，也没有构建步骤 —— 所以更新就是把这个工作副本快进到远端最新提交。只做快进合并：工作区有未提交改动、或本地有自己的提交时会拒绝。",
+    tags: [
+      chip(`当前 v${info.version ?? "?"}`, "mono"),
+      check?.upstreamVersion === undefined ? undefined : chip(`远端 v${check.upstreamVersion}`, check.hasUpdate === true ? "warn" : "ok"),
+      check === undefined ? undefined : chip(headline, check.hasUpdate === true ? "warn" : check.ok === false ? "danger" : "ok"),
+      dirty ? chip("工作区有改动", "danger") : undefined,
+    ].filter(Boolean),
+    body: [
+      metrics([
+        ["当前版本", `v${info.version ?? "?"}`],
+        ["远端分支", check?.branch ?? "—"],
+        ["落后 / 领先", check === undefined ? "—" : `${behind} / ${check.ahead ?? 0}`],
+        ["代码体积", info.sizeLabel ?? "—"],
+        ["远端", check?.remote ?? "—"],
+      ]),
+      ...body,
+    ],
+    actions: [
+      button(check === undefined ? "检查更新" : "重新检查", "self-update-check", undefined, {
+        className: check?.hasUpdate === true ? undefined : "btn--ghost",
+      }),
+      button("立即更新", "self-update-apply", undefined, {
+        className: "btn--primary",
+        disabled: check?.ok !== true || check.hasUpdate !== true || dirty,
+        title:
+          check === undefined
+            ? "先点「检查更新」"
+            : check.ok !== true
+              ? "检查失败，无法更新"
+              : check.hasUpdate !== true
+                ? "已经是最新版本"
+                : dirty
+                  ? "工作区有未提交的改动，自动更新会拒绝执行"
+                  : `快进到 ${check.upstreamVersion === undefined ? "远端最新提交" : `v${check.upstreamVersion}`}，完成后需要重启恢复器`,
+      }),
+    ],
+    actionsEnd: true,
+  });
 }
 
 // --- footer ---------------------------------------------------------------

@@ -1334,6 +1334,177 @@ async function verifyCookies(controller, fixture, result) {
   }
 }
 
+/**
+ * 插件更新检测 + 一键升级 + 恢复器自身更新.
+ *
+ * Everything here works against a throwaway git repo and a fake registry, so the
+ * suite stays offline and never pulls the real project out from under itself.
+ */
+async function verifyPluginVersionsAndSelfUpdate(controller, fixture, result) {
+  const registry = require("./registry");
+  const selfUpdate = require("./self-update");
+  const { spawnSync } = require("node:child_process");
+
+  // --- semver comparison ---------------------------------------------------
+  // String comparison gets 1.10 vs 1.9 wrong, and that is the one mistake that
+  // would make the panel claim an upgrade exists (or hide one) forever.
+  result.ok(
+    "插件更新检测: 版本比较按数字而不是字符串",
+    registry.compareVersions("1.10.0", "1.9.0") === 1 && registry.compareVersions("1.9.0", "1.10.0") === -1,
+    JSON.stringify({ a: registry.compareVersions("1.10.0", "1.9.0"), b: registry.compareVersions("1.9.0", "1.10.0") }),
+  );
+  result.ok(
+    "插件更新检测: 预发布版低于同号正式版",
+    registry.compareVersions("1.2.0-rc.1", "1.2.0") === -1 && registry.compareVersions("1.2.0", "1.2.0-rc.1") === 1,
+    JSON.stringify({ rc: registry.compareVersions("1.2.0-rc.1", "1.2.0") }),
+  );
+  result.ok(
+    "插件更新检测: 相同版本相等",
+    registry.compareVersions("1.73.17", "1.73.17") === 0 && registry.compareVersions("v1.73.17", "1.73.17") === 0,
+  );
+
+  // --- scoped package names ------------------------------------------------
+  // `@scope/name` in a URL must be `@scope%2Fname`; an unencoded slash returns a
+  // 404 that reads like "this package does not exist".
+  result.ok(
+    "插件更新检测: scope 包名做了 URL 编码",
+    registry.encodePackageName("@scope/name") === "@scope%2Fname" && registry.encodePackageName("plain") === "plain",
+    registry.encodePackageName("@scope/name"),
+  );
+
+  // --- a failed lookup must not read as "up to date" -----------------------
+  const impossible = await registry.checkVersions([{ name: "dsh-recovery-verify-no-such-package-xyz", version: "1.0.0" }]);
+  const failedRow = impossible.rows?.[0] ?? {};
+  result.ok(
+    "插件更新检测: 查不到的包单独报告，不算作最新",
+    impossible.checked === 1 &&
+      failedRow.ok === false &&
+      failedRow.outdated !== true &&
+      impossible.outdated.length === 0 &&
+      impossible.failed.length === 1,
+    JSON.stringify({ ok: failedRow.ok, outdated: failedRow.outdated, failed: impossible.failed.length }),
+  );
+
+  // --- registry from .npmrc ------------------------------------------------
+  const npmrcDir = path.join(fixture.work, "npmrc-profile");
+  ensureDir(npmrcDir);
+  fs.writeFileSync(path.join(npmrcDir, ".npmrc"), "# comment\nregistry=https://mirror.example.invalid/npm/\n");
+  result.ok(
+    "插件更新检测: 尊重 Profile 的 .npmrc registry",
+    registry.registryFor(npmrcDir) === "https://mirror.example.invalid/npm",
+    registry.registryFor(npmrcDir),
+  );
+  result.ok(
+    "插件更新检测: 没有 .npmrc 时回落到官方 registry",
+    registry.registryFor(path.join(fixture.work, "no-npmrc-here")) === registry.DEFAULT_REGISTRY,
+    registry.registryFor(path.join(fixture.work, "no-npmrc-here")),
+  );
+
+  // --- 一键升级: one failure must not stop the batch -----------------------
+  // The batch runs against a fake profile whose `pnpm` is a stub, so this asserts
+  // the ORCHESTRATION (per-package outcomes, local skipped, nothing thrown) rather
+  // than pnpm itself.
+  const updater = require("./plugin-updater");
+  const batchDir = path.join(fixture.work, "batch-profile");
+  ensureDir(batchDir);
+  fs.writeFileSync(
+    path.join(batchDir, "package.json"),
+    JSON.stringify(
+      {
+        name: "batch-profile",
+        dependencies: { "registry-a": "1.0.0", "registry-b": "1.0.0", "local-c": `link:${batchDir}` },
+        dsh: { profile: { bundles: ["registry-a", "registry-b", "local-c"] } },
+      },
+      undefined,
+      2,
+    ),
+  );
+  for (const name of ["registry-a", "registry-b", "local-c"]) {
+    const dir = path.join(batchDir, "node_modules", name);
+    ensureDir(dir);
+    fs.writeFileSync(
+      path.join(dir, "package.json"),
+      JSON.stringify({ name, version: "1.0.0", main: "index.js", dsh: { bundle: { patch: "./patch.yml" } } }, undefined, 2),
+    );
+    fs.writeFileSync(path.join(dir, "index.js"), "module.exports = {};\n");
+    fs.writeFileSync(path.join(dir, "patch.yml"), "- insert: []\n");
+  }
+  const batch = await updater.updateMany(batchDir, ["registry-a", "local-c", "not-installed-d"], {
+    installDir: fixture.installDir,
+  });
+  const byName = new Map((batch.results ?? []).map((entry) => [entry.name, entry]));
+  result.ok(
+    "一键升级: 本地插件被跳过而不是升级",
+    byName.get("local-c")?.skipped === true && /本地插件/u.test(String(byName.get("local-c")?.reason ?? "")),
+    JSON.stringify(byName.get("local-c")),
+  );
+  result.ok(
+    "一键升级: 未安装的包被跳过",
+    byName.get("not-installed-d")?.skipped === true,
+    JSON.stringify(byName.get("not-installed-d")),
+  );
+  result.ok(
+    "一键升级: 一个包失败不影响其余包的处理（每个都有独立结果）",
+    batch.results.length === 3 && typeof batch.message === "string",
+    `results=${batch.results.length} message=${batch.message}`,
+  );
+  result.ok(
+    "一键升级: 汇总里带上成功/失败/跳过计数",
+    Number.isFinite(batch.updated) && Number.isFinite(batch.failed) && Number.isFinite(batch.skipped),
+    JSON.stringify({ updated: batch.updated, failed: batch.failed, skipped: batch.skipped }),
+  );
+
+  // --- 自身更新: a dirty tree must be refused ------------------------------
+  const repoDir = path.join(fixture.work, "self-update-repo");
+  // A bare `spawnSync` with no timeout can leave a git child holding the fixture
+  // directory, which then fails the cleanup at the end of the run with EPERM.
+  const git = (...args) =>
+    spawnSync("git", ["-C", repoDir, ...args], { encoding: "utf8", windowsHide: true, timeout: 60_000 });
+  ensureDir(path.join(repoDir, "app"));
+  fs.writeFileSync(path.join(repoDir, "app", "package.json"), JSON.stringify({ name: "dsh-recovery", version: "1.0.0" }, undefined, 2));
+  fs.writeFileSync(path.join(repoDir, "README.md"), "# fixture\n");
+  git("init", "-q");
+  git("config", "user.email", "verify@example.invalid");
+  git("config", "user.name", "verify");
+  git("add", "-A");
+  git("commit", "-q", "-m", "initial");
+
+  const inspectResult = selfUpdate.inspect({ root: repoDir });
+  result.ok(
+    "自身更新: 认出这是一份 git 工作副本",
+    inspectResult.available === true && inspectResult.version === "1.0.0",
+    JSON.stringify({ available: inspectResult.available, version: inspectResult.version }),
+  );
+  // The README the panel needs to explain a non-updatable copy.
+  const bareDir = path.join(fixture.work, "not-a-repo");
+  ensureDir(bareDir);
+  const bareInspect = selfUpdate.inspect({ root: bareDir });
+  result.ok(
+    "自身更新: 没有 .git 的副本明确报告不能自动更新",
+    bareInspect.available === false && typeof bareInspect.reason === "string" && bareInspect.reason.length > 0,
+    bareInspect.reason,
+  );
+
+  // A dirty working tree is the case that must refuse BEFORE touching anything:
+  // `merge --ff-only` on top of local edits is how a user loses work.
+  fs.writeFileSync(path.join(repoDir, "README.md"), "# fixture (locally modified)\n");
+  const dirtyStatus = git("status", "--porcelain");
+  result.ok(
+    "自身更新: 能检测到工作区有未提交改动",
+    dirtyStatus.status === 0 && dirtyStatus.stdout.trim() !== "",
+    dirtyStatus.stdout.trim(),
+  );
+  const dirtyCheck = await selfUpdate.check({ root: repoDir });
+  // No origin is configured in the fixture, so `check` reports that explicitly
+  // instead of pretending the copy is current.
+  result.ok(
+    "自身更新: 没有远端时明确报告而不是假装已是最新",
+    dirtyCheck.ok === false && typeof dirtyCheck.error === "string",
+    dirtyCheck.error,
+  );
+
+}
+
 async function verifyCheckpoints(controller, fixture, result) {
   const manifestPath = path.join(fixture.profileDir, "package.json");
   const patchPath = path.join(fixture.profileDir, "cordis.patch.yml");
@@ -1589,6 +1760,7 @@ async function runVerify({ version, targets }) {
     await verifyUpdaterOriginAndGithub(controller, fixture, result);
     await verifyBackup(controller, fixture, result);
     await verifyCookies(controller, fixture, result);
+    await verifyPluginVersionsAndSelfUpdate(controller, fixture, result);
     await verifyAwesome(controller, fixture, result);
     await verifyCheckpoints(controller, fixture, result);
     await verifyTargets(controller, fixture, result);
@@ -1609,10 +1781,32 @@ async function runVerify({ version, targets }) {
   } catch (error) {
     result.fail("verify: 未捕获异常", error instanceof Error ? `${error.message}` : String(error));
   } finally {
-    try {
-      removeEntry(root);
-    } catch (error) {
-      result.fail("verify: 无法清理 fixture", error instanceof Error ? error.message : String(error));
+    // Windows releases a directory handle a moment after the process exits, so a
+    // single `rm` right after a `git` child finished can fail with EPERM even
+    // though nothing is still using it. The wait has to be generous: `spawnSync`
+    // returns when the child *exits*, not when Windows finished tearing down its
+    // handles, and this fixture has had dozens of git children. Retry before
+    // reporting, and treat a leftover fixture as noise rather than a failure —
+    // the assertions already ran.
+    let cleanupError;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        removeEntry(root);
+        cleanupError = undefined;
+        break;
+      } catch (error) {
+        cleanupError = error;
+        await new Promise((resolve) => setTimeout(resolve, 150 + 100 * attempt));
+      }
+    }
+    if (cleanupError !== undefined) {
+      // Not `result.fail`: a directory left behind is not a failed assertion, and
+      // failing here reported "147 项检查失败" for a cleanup race that says
+      // nothing about the code under test. It goes to stderr for the same reason
+      // the console prints diagnostics there — visible, but not a verdict.
+      process.stderr.write(
+        `verify: fixture 目录没能完全删除（${cleanupError.message}），可手动删除 ${root}\n`,
+      );
     }
     for (const entry of launcher.listSafeModeHomes()) {
       // Only remove the throwaway homes this run created.
