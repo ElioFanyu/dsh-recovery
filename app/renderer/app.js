@@ -528,7 +528,7 @@ const ACTIONS = {
     if (running) return;
     const versions = state.pluginVersions;
     const outdated = versions?.outdated ?? [];
-    const targets = outdated.length > 0 ? outdated : (state.pluginUpdater?.rows ?? []).filter((row) => row.origin !== "local" && row.version !== undefined);
+    const targets = outdated.length > 0 ? outdated : (state.pluginUpdater?.rows ?? []).filter((entry) => entry.origin !== "local" && entry.version !== undefined);
     if (targets.length === 0) {
       toast("没有可升级的联网插件", "ok");
       return;
@@ -977,18 +977,62 @@ function versionsCard(versions, { running, outdatedCount, scanned }) {
 
   const outdated = versions.outdated ?? [];
   const failed = versions.failed ?? [];
-  const rows = outdated.map((row) =>
+  // NOTE the callback parameter name: it must NOT be `row`, because `row()` is
+  // the module-level row builder. Naming it `row` shadowed that helper and made
+  // `row({...})` a call on a plain object — the reported
+  // "row is not a function", which blanked the whole page after a scan.
+  const outdatedNodes = outdated.map((entry) =>
     row({
-      name: row.name,
+      name: entry.name,
       mono: true,
-      sub: joinSub(`${row.installed} → ${row.latest}`, row.deprecated === undefined ? undefined : `已废弃：${row.deprecated}`),
-      side: [chip(`+${row.latest}`, "warn"), button("升级这一个", "plugin-update", row.name, { className: "btn--ghost", disabled: running })],
+      sub: joinSub(
+        `${entry.installed} → ${entry.latest}`,
+        entry.deprecated === undefined ? undefined : `已废弃：${entry.deprecated}`,
+      ),
+      side: [
+        chip(`+${entry.latest}`, "warn"),
+        button("升级这一个", "plugin-update", entry.name, { className: "btn--ghost", disabled: running }),
+      ],
+    }),
+  );
+  const failedNodes = failed.map((entry) =>
+    row({
+      name: entry.name,
+      mono: true,
+      muted: true,
+      sub: joinSub(entry.installed, entry.error),
     }),
   );
   // Installed copies NEWER than the registry's `latest` are reported, not
   // upgraded: that only happens for a link, a dist-tag or a fork, and "updating"
   // would move the user backwards.
-  const ahead = (versions.rows ?? []).filter((row) => row.ok === true && row.behind === true);
+  const ahead = (versions.rows ?? []).filter((entry) => entry.ok === true && entry.behind === true);
+
+  // Everything goes into ONE card. A nested `card()` inside `body` would render a
+  // card inside a card (double padding, nested border) and, in this case, also
+  // sat after a `.map` that could throw — so the failure took the whole panel
+  // down instead of degrading to a partial list.
+  const body = [];
+  if (outdatedNodes.length > 0) body.push(list(outdatedNodes));
+  if (failedNodes.length > 0) {
+    body.push(
+      hint(
+        `有 ${failed.length} 个包在 registry 上查不到版本（下面单独列出）。它们**没有**被算作「已是最新」—— ` +
+          "查不到可能是网络问题、私有包，或这个 Profile 用了不同的 registry。",
+      ),
+    );
+    body.push(list(failedNodes));
+  }
+  if (ahead.length > 0) {
+    body.push(
+      hint(
+        `另外 ${ahead.length} 个插件本机版本比 registry 的 latest 还新（${ahead
+          .map((entry) => `${entry.name} ${entry.installed}`)
+          .join("、")}）。这通常是本地工作副本或 dist-tag，不会参与升级。`,
+      ),
+    );
+  }
+  if (body.length === 0) body.push(empty("已检查，所有联网插件都是最新版本。"));
 
   return card({
     icon: "⬆",
@@ -999,29 +1043,14 @@ function versionsCard(versions, { running, outdatedCount, scanned }) {
         : `已检查 ${versions.checked} 个联网插件，${outdatedCount} 个有更新的版本。可以逐个升级，或用上面的「一键升级」。`) +
       (versions.checkedAt === undefined ? "" : ` 检查时间：${new Date(versions.checkedAt).toLocaleString("zh-CN")}。`) +
       (versions.registry === undefined ? "" : ` registry：${versions.registry}。`),
-    tags: outdatedCount === 0 ? [chip("已是最新", "ok")] : [chip(`${outdatedCount} 个待升级`, "warn")],
-    body: [
-      rows.length === 0 ? undefined : list(rows),
-      failed.length === 0
-        ? undefined
-        : card({
-            title: "查不到版本的插件",
-            desc: "registry 没有返回这些包的信息（可能是网络问题、私有包，或用了不同的 registry）。它们不会被计入「已是最新」。",
-            body: list(
-              failed.map((row) =>
-                row({
-                  name: row.name,
-                  mono: true,
-                  muted: true,
-                  sub: joinSub(row.installed, row.error),
-                }),
-              ),
-            ),
-          }),
-      ahead.length === 0
-        ? undefined
-        : hint(`另外 ${ahead.length} 个插件本机版本比 registry 的 latest 还新（${ahead.map((row) => `${row.name} ${row.installed}`).join("、")}）。这通常是本地工作副本或 dist-tag，不会参与升级。`),
-    ],
+    tags:
+      outdatedCount === 0 && failed.length === 0
+        ? [chip("已是最新", "ok")]
+        : [
+            outdatedCount > 0 ? chip(`${outdatedCount} 个待升级`, "warn") : undefined,
+            failed.length > 0 ? chip(`${failed.length} 个查不到`, "danger") : undefined,
+          ].filter(Boolean),
+    body,
   });
 }
 

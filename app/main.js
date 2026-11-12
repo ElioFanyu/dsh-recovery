@@ -134,6 +134,9 @@ async function waitForWindow(timeoutMs) {
  */
 async function runUiCheck({ shot }) {
   const issues = [];
+  // Evidence that the registry scan really ran and rendered, so the digest can
+  // show it instead of just "no issues".
+  let scanResult;
   const win = await waitForWindow(20000);
   // A renderer exception surfaces as an opaque "Script failed to execute", so
   // every console message is collected and reported alongside the issues.
@@ -499,6 +502,51 @@ async function runUiCheck({ shot }) {
       issues.push("插件管理：没有检测到更新时「一键升级」仍可点击");
     }
     if (!pluginsPanel.text.includes("插件更新")) issues.push("插件管理面板缺少「插件更新」区域");
+
+    // Click 「检测更新」 for real. This is the check that would have caught the
+    // `row is not a function` regression: the scan itself succeeded, then the
+    // RENDER of its result threw and blanked the page. Asserting the button
+    // exists is not enough — the code path has to be run.
+    const checkButton = pluginsPanel.actions.find((button) => button.action === "plugin-version-check");
+    if (checkButton === undefined) {
+      issues.push("插件管理面板没有「检测更新」按钮");
+    } else if (checkButton.disabled !== true) {
+      await win.webContents.executeJavaScript(
+        `document.querySelector('.panel[data-panel="plugins"] button[data-action="plugin-version-check"]').click()`,
+      );
+      // The scan hits the npm registry, so allow real network time; the point is
+      // to reach the re-render, not to measure latency.
+      await sleep(6000);
+      const afterScan = await win.webContents.executeJavaScript(
+        `({
+           renderError: window.__renderError ?? null,
+           footer: [...document.querySelectorAll('#footer-actions button')].length,
+           cards: [...document.querySelectorAll('.panel[data-panel="plugins"] section.card')].length,
+           text: document.querySelector('.panel[data-panel="plugins"]')?.innerText ?? '',
+           toasts: [...document.querySelectorAll('#toasts .toast')].map((node) => node.textContent),
+         })`,
+      );
+      if (afterScan.renderError !== null) issues.push(`点击「检测更新」后渲染异常：${afterScan.renderError}`);
+      if (afterScan.footer === 0) issues.push("点击「检测更新」后页脚按钮消失（渲染崩溃）");
+      // The page went blank in the reported bug; a panel with no cards is that
+      // same failure seen from the outside.
+      if (afterScan.cards === 0) issues.push("点击「检测更新」后插件面板没有任何卡片（页面被清空）");
+      // The scan must produce a POSITIVE result, not merely "no crash": the
+      // result card reports how many packages were compared. Requiring that
+      // sentence is what separates "the scan ran and rendered" from "nothing
+      // happened because the click did not reach the backend".
+      const compared = /已检查\s*\d+\s*个联网插件/u.test(afterScan.text);
+      if (!compared) {
+        issues.push(
+          `点击「检测更新」后没有出现「已检查 N 个联网插件」的结果（面板文字：${afterScan.text.slice(0, 200).replace(/\s+/gu, " ")}）`,
+        );
+      }
+      const scanCrash = (afterScan.toasts ?? []).find((text) =>
+        /is not a function|Cannot read propert|undefined is not/u.test(text),
+      );
+      if (scanCrash !== undefined) issues.push(`点击「检测更新」弹出了代码异常：${scanCrash}`);
+      scanResult = { compared, cards: afterScan.cards, sample: afterScan.text.slice(0, 160) };
+    }
   }
 
   // Pointing the console at an install that auto-detection missed must be
@@ -632,7 +680,9 @@ async function runUiCheck({ shot }) {
       plugins: pluginsPanel?.actions.filter((button) => button.action === "enable-all-bundles") ?? [],
       checkpoints: checkpointsPanel?.actions.filter((button) => button.action === "delete-all-checkpoints") ?? [],
     },
-    updater: updaterPanel === null ? null : { actions: updaterPanel.actions, text: updaterPanel.text.slice(0, 400) },
+    updater: updaterPanel === null ? null : { actions: updaterPanel.actions, text: updaterPanel.text },
+    // Whether the real 「检测更新」 click produced a rendered result.
+    scanResult: scanResult ?? null,
     awesome: awesomePanel === null ? null : { actions: awesomePanel.actions, text: awesomePanel.text.slice(0, 400) },
     extraShots,
     shot,
