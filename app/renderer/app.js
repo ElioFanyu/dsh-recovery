@@ -943,116 +943,6 @@ function cookieCard(running) {
   });
 }
 
-/**
- * Which installed plugins have a newer version on the registry.
- *
- * Three distinct states have to be told apart, because "0 个有更新" means
- * something different in each:
- *
- *   * never scanned   → "还没检查", with the button that scans;
- *   * scanned, clean  → "都是最新版本", with the time it was checked;
- *   * scanned, behind → the list, each row showing the exact version jump.
- *
- * Packages the registry could not answer for (network, unpublished name, a
- * mirror that does not have it) are listed separately instead of being counted
- * as "no update" — silently turning a failure into "up to date" is the one
- * mistake this card must not make.
- */
-function versionsCard(versions, { running, outdatedCount, scanned }) {
-  if (versions === undefined) {
-    return card({
-      icon: "⬆",
-      title: "插件更新",
-      desc: "还没检查过 registry。点上面的「检测更新」向 npm 查询每个联网插件的最新发布版本。",
-      body: empty("尚未检查。"),
-    });
-  }
-  if (scanned !== true) {
-    return card({
-      icon: "⬆",
-      title: "插件更新",
-      desc: "还没检查过 registry。点上面的「检测更新」向 npm 查询每个联网插件的最新发布版本（只读，不需要停止应用）。",
-    });
-  }
-
-  const outdated = versions.outdated ?? [];
-  const failed = versions.failed ?? [];
-  // NOTE the callback parameter name: it must NOT be `row`, because `row()` is
-  // the module-level row builder. Naming it `row` shadowed that helper and made
-  // `row({...})` a call on a plain object — the reported
-  // "row is not a function", which blanked the whole page after a scan.
-  const outdatedNodes = outdated.map((entry) =>
-    row({
-      name: entry.name,
-      mono: true,
-      sub: joinSub(
-        `${entry.installed} → ${entry.latest}`,
-        entry.deprecated === undefined ? undefined : `已废弃：${entry.deprecated}`,
-      ),
-      side: [
-        chip(`+${entry.latest}`, "warn"),
-        button("升级这一个", "plugin-update", entry.name, { className: "btn--ghost", disabled: running }),
-      ],
-    }),
-  );
-  const failedNodes = failed.map((entry) =>
-    row({
-      name: entry.name,
-      mono: true,
-      muted: true,
-      sub: joinSub(entry.installed, entry.error),
-    }),
-  );
-  // Installed copies NEWER than the registry's `latest` are reported, not
-  // upgraded: that only happens for a link, a dist-tag or a fork, and "updating"
-  // would move the user backwards.
-  const ahead = (versions.rows ?? []).filter((entry) => entry.ok === true && entry.behind === true);
-
-  // Everything goes into ONE card. A nested `card()` inside `body` would render a
-  // card inside a card (double padding, nested border) and, in this case, also
-  // sat after a `.map` that could throw — so the failure took the whole panel
-  // down instead of degrading to a partial list.
-  const body = [];
-  if (outdatedNodes.length > 0) body.push(list(outdatedNodes));
-  if (failedNodes.length > 0) {
-    body.push(
-      hint(
-        `有 ${failed.length} 个包在 registry 上查不到版本（下面单独列出）。它们**没有**被算作「已是最新」—— ` +
-          "查不到可能是网络问题、私有包，或这个 Profile 用了不同的 registry。",
-      ),
-    );
-    body.push(list(failedNodes));
-  }
-  if (ahead.length > 0) {
-    body.push(
-      hint(
-        `另外 ${ahead.length} 个插件本机版本比 registry 的 latest 还新（${ahead
-          .map((entry) => `${entry.name} ${entry.installed}`)
-          .join("、")}）。这通常是本地工作副本或 dist-tag，不会参与升级。`,
-      ),
-    );
-  }
-  if (body.length === 0) body.push(empty("已检查，所有联网插件都是最新版本。"));
-
-  return card({
-    icon: "⬆",
-    title: `插件更新（${outdatedCount} 个有新版${failed.length > 0 ? ` · ${failed.length} 个查不到` : ""}）`,
-    desc:
-      (outdatedCount === 0
-        ? `已检查 ${versions.checked} 个联网插件，都是最新版本。`
-        : `已检查 ${versions.checked} 个联网插件，${outdatedCount} 个有更新的版本。可以逐个升级，或用上面的「一键升级」。`) +
-      (versions.checkedAt === undefined ? "" : ` 检查时间：${new Date(versions.checkedAt).toLocaleString("zh-CN")}。`) +
-      (versions.registry === undefined ? "" : ` registry：${versions.registry}。`),
-    tags:
-      outdatedCount === 0 && failed.length === 0
-        ? [chip("已是最新", "ok")]
-        : [
-            outdatedCount > 0 ? chip(`${outdatedCount} 个待升级`, "warn") : undefined,
-            failed.length > 0 ? chip(`${failed.length} 个查不到`, "danger") : undefined,
-          ].filter(Boolean),
-    body,
-  });
-}
 
 // --- panel: plugins (management + updates on one page) --------------------
 
@@ -1085,6 +975,14 @@ function renderPlugins() {
   const updaterRows = updaterReady ? (info.rows ?? []) : [];
   const updaterByName = new Map(updaterRows.map((entry) => [entry.name, entry]));
 
+  // Registry-scan verdict by package name, so a row can show 「0.5.32 → 0.5.34」
+  // inline. The scan result also covers packages that could not be looked up and
+  // ones already newer than the registry — only `outdated` rows get the arrow.
+  const versionByName = new Map();
+  for (const entry of state.pluginVersions?.rows ?? []) {
+    versionByName.set(entry.name, entry);
+  }
+
   const plugins = detail.plugins;
   const bundles = plugins.filter((plugin) => plugin.bundle === true);
   const others = plugins.filter((plugin) => plugin.bundle !== true);
@@ -1114,6 +1012,9 @@ function renderPlugins() {
   const versions = state.pluginVersions;
   const outdatedRows = versions?.outdated ?? [];
   const outdatedCount = outdatedRows.length;
+  // Packages the registry could not answer for. Kept visible on their own because
+  // "查不到" must never be read as "已是最新".
+  const failedVersions = versions?.failed ?? [];
   const scanned = versions?.checkedAt !== undefined;
   const checkingVersions = busy && busyLabel.includes("检查插件更新");
   const upgradingAll = busy && busyLabel.includes("升级全部");
@@ -1295,7 +1196,7 @@ function renderPlugins() {
           "用 link: / 符号链接指向本机工作副本的插件，代码在它自己的文件夹里。「打开文件夹」定位到那本目录，改代码立即生效。这里不提供升级 —— pnpm 升级会把这个链接换成 registry 下载的副本，你的工作副本就被断开了。" +
           (offCountLocal > 0 ? ` 已禁用的 ${offCountLocal} 个排在最后。` : ""),
         tags: [chip(`${localPlugins.length} 个`, "ok")],
-        body: list(sorted.map((plugin) => pluginRow(plugin, updaterByName.get(plugin.name), running))),
+        body: list(sorted.map((plugin) => pluginRow(plugin, updaterByName.get(plugin.name), running, versionByName.get(plugin.name)))),
       }),
     );
   }
@@ -1313,7 +1214,7 @@ function renderPlugins() {
           (noHome > 0 ? `，其中 ${noHome} 个没有声明 homepage / repository，无法打开主页` : "") +
           (offCountRegistry > 0 ? `；已禁用的 ${offCountRegistry} 个排在最后。` : "。"),
         tags: [chip(`${registryPlugins.length} 个`)],
-        body: list(sorted.map((plugin) => pluginRow(plugin, updaterByName.get(plugin.name), running))),
+        body: list(sorted.map((plugin) => pluginRow(plugin, updaterByName.get(plugin.name), running, versionByName.get(plugin.name)))),
       }),
     );
   }
@@ -1365,12 +1266,35 @@ function renderPlugins() {
     );
   }
 
-  // --- registry versions: which plugins have something newer --------------
-  // The list is what 「一键升级」 acts on, so it is shown as its own card rather
-  // than folded into each row: the point is to see, at a glance, how many
-  // upgrades are pending and what they would bump.
-  if (updaterReady) {
-    nodes.push(versionsCard(versions, { running, outdatedCount, scanned }));
+  // --- registry versions ---------------------------------------------------
+  // No separate card: the version jump is rendered on each plugin row, next to
+  // the version it upgrades from. What is left here is the one thing a row
+  // cannot say by itself — that the scan could not reach some packages. Those
+  // are NOT "up to date", and silently dropping them would be the worst possible
+  // reading of a failed check.
+  if (updaterReady && scanned && failedVersions.length > 0) {
+    nodes.push(
+      card({
+        title: `插件更新：${failedVersions.length} 个包查不到版本`,
+        desc:
+          `registry 没有返回这些包的信息（网络问题、私有包，或这个 Profile 用了不同的 registry）。` +
+          "它们**没有**被算作「已是最新」，也不在「一键升级」的范围内。" +
+          (versions?.registry === undefined ? "" : ` 本次查询的 registry：${versions.registry}`) +
+          (versions?.checkedAt === undefined ? "" : `，时间：${new Date(versions.checkedAt).toLocaleString("zh-CN")}`) +
+          "。",
+        tags: [chip(`${failedVersions.length} 个`, "danger")],
+        body: list(
+          failedVersions.map((entry) =>
+            row({
+              name: entry.name,
+              mono: true,
+              muted: true,
+              sub: joinSub(entry.installed, entry.error),
+            }),
+          ),
+        ),
+      }),
+    );
   }
 
   // --- the market itself: install it, or update it -------------------------
@@ -1465,7 +1389,7 @@ function renderPlugins() {
  * user actually edits — and pnpm has nothing to upgrade when the package is not
  * on disk. Such rows get 检查 instead, which is the only useful verb there.
  */
-function pluginRow(plugin, updaterRow, running) {
+function pluginRow(plugin, updaterRow, running, versionInfo) {
   const core = plugin.core === true;
   const cannotUninstall = core || plugin.quarantinable !== true;
   const local = plugin.source === "local";
@@ -1477,6 +1401,12 @@ function pluginRow(plugin, updaterRow, running) {
   const canOpen = local || builtin ? plugin.installedLocal === true || typeof plugin.sourcePath === "string" : typeof plugin.homepage === "string";
   const problems = updaterRow?.problems ?? [];
   const upgradable = !local && !builtin && updaterRow !== undefined && updaterRow.version !== undefined && updaterRow.declared !== undefined;
+  // The registry scan's verdict for this package, if it was part of the scan.
+  // Rendered inline (「0.5.32 → 0.5.34」) instead of in a separate card: the
+  // version jump belongs next to the version it upgrades from, and a separate
+  // list meant reading the same package name twice.
+  const outdated = versionInfo?.outdated === true;
+  const latest = versionInfo?.latest;
   return row({
     name: plugin.name,
     mono: true,
@@ -1484,13 +1414,17 @@ function pluginRow(plugin, updaterRow, running) {
     muted: problems.length > 0,
     sub: joinSub(
       plugin.categoryLabel,
-      plugin.version,
+      // `joinSub` drops undefined parts, so the arrow only appears when a newer
+      // version actually exists.
+      outdated && latest !== undefined ? `${plugin.version ?? updaterRow?.version} → ${latest}` : plugin.version,
       plugin.installedLocal === true ? undefined : "未安装在本地",
+      outdated ? "有新版本" : undefined,
       local ? plugin.sourcePath ?? plugin.spec : undefined,
       problems.length > 0 ? problems.join("；") : undefined,
     ),
     side: [
       chip(plugin.enabled === true ? "已启用" : "已禁用", plugin.enabled === true ? "ok" : undefined),
+      outdated ? chip(`可升级 +${latest}`, "warn") : undefined,
       button(local || builtin ? "打开文件夹" : "打开官网", "open-plugin", plugin.name, {
         className: "btn--ghost",
         disabled: canOpen !== true,

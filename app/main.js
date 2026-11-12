@@ -501,7 +501,11 @@ async function runUiCheck({ shot }) {
     if (updateAll !== undefined && hasOutdated !== true && updateAll.disabled !== true) {
       issues.push("插件管理：没有检测到更新时「一键升级」仍可点击");
     }
-    if (!pluginsPanel.text.includes("插件更新")) issues.push("插件管理面板缺少「插件更新」区域");
+    // There is no separate 「插件更新」 card any more — the version jump lives on
+    // each plugin row. What must exist is the scan button that produces it.
+    if (!pluginsPanel.actions.some((button) => button.action === "plugin-version-check")) {
+      issues.push("插件管理面板缺少「检测更新」入口");
+    }
 
     // Click 「检测更新」 for real. This is the check that would have caught the
     // `row is not a function` regression: the scan itself succeeded, then the
@@ -518,34 +522,55 @@ async function runUiCheck({ shot }) {
       // to reach the re-render, not to measure latency.
       await sleep(6000);
       const afterScan = await win.webContents.executeJavaScript(
-        `({
-           renderError: window.__renderError ?? null,
-           footer: [...document.querySelectorAll('#footer-actions button')].length,
-           cards: [...document.querySelectorAll('.panel[data-panel="plugins"] section.card')].length,
-           text: document.querySelector('.panel[data-panel="plugins"]')?.innerText ?? '',
-           toasts: [...document.querySelectorAll('#toasts .toast')].map((node) => node.textContent),
-         })`,
+        `(() => {
+           const panel = document.querySelector('.panel[data-panel="plugins"]');
+           const rows = [...(panel?.querySelectorAll('.row.row--plugin') ?? [])];
+           return {
+             renderError: window.__renderError ?? null,
+             footer: [...document.querySelectorAll('#footer-actions button')].length,
+             cards: [...document.querySelectorAll('.panel[data-panel="plugins"] section.card')].length,
+             cardTitles: [...document.querySelectorAll('.panel[data-panel="plugins"] .card__title')].map((n) => n.textContent ?? ''),
+             text: panel?.innerText ?? '',
+             // 「0.5.32 → 0.5.34」 rendered on a plugin row.
+             inlineJumps: rows.filter((r) => /\\d+\\.\\d+\\.\\d+\\s*→\\s*\\d+\\.\\d+\\.\\d+/u.test(r.innerText ?? '')).length,
+             upgradeBadges: rows.filter((r) => (r.innerText ?? '').includes('可升级')).length,
+             toasts: [...document.querySelectorAll('#toasts .toast')].map((node) => node.textContent),
+           };
+         })()`,
       );
       if (afterScan.renderError !== null) issues.push(`点击「检测更新」后渲染异常：${afterScan.renderError}`);
       if (afterScan.footer === 0) issues.push("点击「检测更新」后页脚按钮消失（渲染崩溃）");
       // The page went blank in the reported bug; a panel with no cards is that
       // same failure seen from the outside.
       if (afterScan.cards === 0) issues.push("点击「检测更新」后插件面板没有任何卡片（页面被清空）");
-      // The scan must produce a POSITIVE result, not merely "no crash": the
-      // result card reports how many packages were compared. Requiring that
-      // sentence is what separates "the scan ran and rendered" from "nothing
-      // happened because the click did not reach the backend".
-      const compared = /已检查\s*\d+\s*个联网插件/u.test(afterScan.text);
+      // The scan must produce a POSITIVE result, not merely "no crash". Since the
+      // version jump is rendered on the plugin row itself, the evidence is either
+      // an inline 「x.y.z → a.b.c」 in a row, or a badge saying a row can upgrade.
+      // Requiring one of them is what separates "the scan ran and rendered" from
+      // "nothing happened because the click never reached the backend".
+      const compared = afterScan.inlineJumps > 0 || afterScan.upgradeBadges > 0 || /已检查\s*\d+\s*个联网插件/u.test(afterScan.text);
       if (!compared) {
         issues.push(
-          `点击「检测更新」后没有出现「已检查 N 个联网插件」的结果（面板文字：${afterScan.text.slice(0, 200).replace(/\s+/gu, " ")}）`,
+          `点击「检测更新」后插件行里没有出现版本箭头或「可升级」标记（面板文字：${afterScan.text.slice(0, 200).replace(/\s+/gu, " ")}）`,
         );
+      }
+      // The jump must live on the row, not in a separate card: that is the whole
+      // point of this layout.
+      const versionCard = afterScan.cardTitles.filter((title) => title.startsWith("插件更新"));
+      if (versionCard.length > 0 && afterScan.inlineJumps === 0 && afterScan.upgradeBadges === 0) {
+        issues.push(`仍在用独立卡片展示可升级插件（${versionCard.join(", ")}）`);
       }
       const scanCrash = (afterScan.toasts ?? []).find((text) =>
         /is not a function|Cannot read propert|undefined is not/u.test(text),
       );
       if (scanCrash !== undefined) issues.push(`点击「检测更新」弹出了代码异常：${scanCrash}`);
-      scanResult = { compared, cards: afterScan.cards, sample: afterScan.text.slice(0, 160) };
+      scanResult = {
+        compared,
+        cards: afterScan.cards,
+        inlineJumps: afterScan.inlineJumps,
+        upgradeBadges: afterScan.upgradeBadges,
+        sample: afterScan.text.slice(0, 160),
+      };
     }
   }
 
@@ -598,6 +623,23 @@ async function runUiCheck({ shot }) {
     if (selfUpdateFound !== true) issues.push("诊断面板里找不到「更新恢复器」卡片");
     await sleep(500);
     fs.writeFileSync(shot.replace(/\.png$/i, "-self-update.png"), (await win.webContents.capturePage()).toPNG());
+  }
+
+  // 联网插件 rows carry the registry verdict inline, so capture that list
+  // scrolled into view: it is the evidence for 「版本号后面的 x → y」.
+  await win.webContents.executeJavaScript('document.querySelector(\'[data-action="tab"][data-arg="plugins"]\').click()');
+  await sleep(400);
+  {
+    const scrolled = await win.webContents.executeJavaScript(`(() => {
+      const cards = [...document.querySelectorAll('.panel[data-panel="plugins"] section.card')];
+      const target = cards.find((c) => (c.querySelector('.card__title')?.textContent ?? '').startsWith('联网插件'));
+      if (target === undefined) return false;
+      target.scrollIntoView({ block: 'start' });
+      return true;
+    })()`);
+    if (scrolled !== true) issues.push("插件管理面板里找不到「联网插件」分组");
+    await sleep(400);
+    fs.writeFileSync(shot.replace(/\.png$/i, "-registry-rows.png"), (await win.webContents.capturePage()).toPNG());
   }
 
   await win.webContents.executeJavaScript("document.querySelector('[data-action=\"tab\"][data-arg=\"restart\"]').click()");
