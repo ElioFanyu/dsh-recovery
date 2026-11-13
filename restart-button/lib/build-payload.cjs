@@ -184,9 +184,23 @@ const edits = [
     file: "main.js",
     name: "精简 Host 子进程构造函数文档注释（等长代价）",
     from: [
-      // 0.2.2 added the `onPluginOperation` parameter; the longer variant must be
-      // listed first only for readability — order does not matter, exactly one
-      // of them can match a given source.
+      // 0.2.2 added the `onPluginOperation` parameter and rewrote `primaryRuntime`;
+      // the newest spelling is listed first only for readability — order does not
+      // matter, exactly one of them can match a given source.
+      lines(
+        "\t* @param node - Absolute Electron executable in Node mode.",
+        "\t* @param runtimeDir - Immutable packages carried by the current application.",
+        "\t* @param projectDir - Desktop plugin profile and child working directory.",
+        "\t* @param inspectPort - Optional loopback inspector port for workspace development.",
+        "\t* @param environment - Environment inherited by the Host and its plugin subprocesses.",
+        "\t* @param onFailure - Receives the first unexpected child failure, including after readiness.",
+        "\t* @param primaryRuntime - Optional bundled dependency payload; the Host exposes it to its profile as `DSH_PRIMARY_RUNTIME`.",
+        "\t* @param packageManager - Bundled pnpm entry and Node launcher directory, scoped to package operations.",
+        "\t* @param onPlatformSession - Private credential updates for embedded Platform views.",
+        "\t* @param onPluginOperation - Optional diagnostic sink; malformed records are ignored without failing the Host.",
+        "\t*/",
+        ""
+      ),
       lines(
         "\t* @param node - Absolute Electron executable in Node mode.",
         "\t* @param runtimeDir - Immutable packages carried by the current application.",

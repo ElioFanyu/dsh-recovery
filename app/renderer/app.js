@@ -2205,6 +2205,7 @@ function renderRestartButton() {
   }
 
   const unknown = patch.entries.some((entry) => entry.verdict === "unknown");
+  const stale = patch.entries.some((entry) => entry.verdict === "stale" || entry.hasStaleBackup === true);
   const hasBackup = patch.entries.some((entry) => entry.hasBackup === true);
 
   nodes.push(
@@ -2213,11 +2214,13 @@ function renderRestartButton() {
       title: "重启按钮补丁",
       desc: patch.installed
         ? `已安装：${patch.installedCount}/${patch.entryTotal} 个条目是补丁内容，重启 DeepSeek Harness 后界面上出现「重启」按钮。`
-        : unknown
-          ? "两个条目的内容与补丁载荷、原始备份都不一致：可能被其它工具或官方更新改写。可以先校验，再决定是否安装或还原。"
-          : "未安装：当前是两个条目的原始内容，「应用」菜单仍是刷新页面 / 重启应用与Host。",
+        : stale
+          ? "DeepSeek Harness 更新过，补丁被整体替换掉了：现在这两个条目是官方的新内容，重新安装即可。旧备份属于更新前的版本，长度不同不能还原，安装时会自动归档。"
+          : unknown
+            ? "两个条目的内容与补丁载荷、原始备份都不一致：可能被其它工具或官方更新改写。可以先校验，再决定是否安装或还原。"
+            : "未安装：当前是两个条目的原始内容，「应用」菜单仍是刷新页面 / 重启应用与Host。",
       tags: [
-        chip(patch.installed ? "已安装" : unknown ? "内容未知" : "未安装", patch.installed ? "ok" : unknown ? "warn" : undefined),
+        chip(patch.installed ? "已安装" : stale ? "更新后失效" : unknown ? "内容未知" : "未安装", patch.installed ? "ok" : unknown || stale ? "warn" : undefined),
         patch.installedAt === undefined ? undefined : chip(`安装于 ${new Date(patch.installedAt).toLocaleString("zh-CN")}`),
         running ? chip("应用运行中（可安全改写）", "warn") : undefined,
       ],
@@ -2238,7 +2241,11 @@ function renderRestartButton() {
                 `头部哈希 ${entry.headerHashLabel}`,
                 entry.integrityOk ? "头部 integrity 一致" : `头部 integrity 不一致（${entry.integrityDetail}）`,
                 entry.lengthMismatch ? "载荷长度与条目长度不一致" : undefined,
-                entry.hasBackup ? "有原始备份" : "无原始备份",
+                entry.hasStaleBackup === true
+                  ? `旧备份 ${formatBytes(entry.backupSize ?? 0)} 属于更新前的版本，不能还原（安装时自动归档）`
+                  : entry.hasBackup
+                    ? "有原始备份"
+                    : "无原始备份",
               ),
               side: [chip(entry.verdictLabel, chipKind(entry.verdictTone))],
             }),

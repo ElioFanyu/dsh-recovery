@@ -29,12 +29,43 @@ const DEFAULT_BACKUP_DIR = path.join(ROOT, "backup");
 const DEFAULT_STATE_FILE = path.join(ROOT, "state.json");
 const ENTRIES = ["lib/main.js", "lib/preload-app.cjs"];
 const DEFAULT_ARCHIVE = "D:\\Dev Tools\\DeepSeek Harness\\resources\\app.asar";
-const TOOL_VERSION = "1.10.2";
+const TOOL_VERSION = "1.10.3";
 
 const none = () => {};
 const short = (hash) => (hash ? `${hash.slice(0, 16)}…` : "(无)");
 const backupName = (entryPath) => `${entryPath.replace(/\//g, "__")}.orig`;
 const samePath = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+
+/**
+ * Why one backup file must never be reused across an application update.
+ *
+ * A DeepSeek Harness update replaces `app.asar` wholesale, so the bytes an older
+ * tool version saved are the *previous* build's `lib/main.js`, at a different
+ * length. Keeping it silently would make `status` claim 「有原始备份」 (the file
+ * exists) while `revert` can only abort on the length check — the user believes a
+ * rollback is available right up until the moment they need it.
+ *
+ * The same size is the invariant, not a metadata date: `apply` and `revert` both
+ * require it, and two upstream builds practically never agree on it.
+ */
+const backupFits = (backupBuf, expectedSize) => backupBuf !== null && backupBuf.length === expectedSize;
+
+/**
+ * Moves a backup from a previous build out of the way.
+ *
+ * The bytes are kept, never deleted: they are the only copy of that build's
+ * original entry, and a user may still be running that build on another machine.
+ * The directory name carries the old size so a human can tell the two apart.
+ */
+function archiveStaleBackup(backupDir, entryPath, backupBuf, reason, log) {
+  const stamp = new Date().toISOString().replace(/[:.]/gu, "-");
+  const dir = path.join(backupDir, `stale-${backupBuf.length}B-${stamp}`);
+  fs.mkdirSync(dir, { recursive: true });
+  const target = path.join(dir, backupName(entryPath));
+  fs.writeFileSync(target, backupBuf);
+  log(`归档      旧备份 ${path.relative(ROOT, target)}（${backupBuf.length} 字节，${reason}）`);
+  return target;
+}
 
 /**
  * Run synchronous filesystem work with Electron's asar support disabled.
@@ -82,9 +113,15 @@ function pathsFor(archive, options = {}) {
   };
 }
 
-/** Payload bytes for one entry, or a message telling the user to build them. */
-function payloadFor(entryPath) {
-  const file = path.join(PAYLOAD_DIR, path.basename(entryPath));
+/**
+ * Payload bytes for one entry, or a message telling the user to build them.
+ *
+ * `dir` is only passed by the self test, which builds a synthetic archive too
+ * small to patch the real 208 MB one. Every caller in the console passes
+ * nothing and therefore reads the payload this repository ships.
+ */
+function payloadFor(entryPath, dir = PAYLOAD_DIR) {
+  const file = path.join(dir, path.basename(entryPath));
   if (!fs.existsSync(file)) {
     throw new Error(`缺少载荷 ${file}；请先运行：node lib\\build-payload.cjs --write`);
   }
@@ -92,9 +129,9 @@ function payloadFor(entryPath) {
 }
 
 /** Payload hashes for every patched entry, for display. */
-function payloadHashes() {
+function payloadHashes(dir = PAYLOAD_DIR) {
   return ENTRIES.map((entryPath) => {
-    const file = path.join(PAYLOAD_DIR, path.basename(entryPath));
+    const file = path.join(dir, path.basename(entryPath));
     const exists = fs.existsSync(file);
     const buf = exists ? fs.readFileSync(file) : null;
     return { entryPath, file, exists, size: buf === null ? null : buf.length, hash: buf === null ? null : asar.sha256(buf) };
@@ -172,30 +209,45 @@ function verdictFor(snap, payload, backupBuf) {
   return "unknown";
 }
 
-const VERDICT_TEXT = { installed: "已安装（= 载荷）", original: "未安装（= 备份的原始内容）", unknown: "未知内容" };
+/**
+ * `unknown` reads as "something damaged these bytes", but after an application
+ * update the entries hold the *official* new content — the patch is simply gone
+ * and reinstalling is the whole fix. A backup left over from the previous build
+ * is the evidence for that story, so it gets its own verdict and its own wording.
+ */
+const verdictWithBackupAge = (snap, payload, backupBuf, staleBackup) =>
+  staleBackup && verdictFor(snap, payload, null) === "unknown" ? "stale" : verdictFor(snap, payload, backupBuf);
+
+const VERDICT_TEXT = {
+  installed: "已安装（= 载荷）",
+  original: "未安装（= 备份的原始内容）",
+  stale: "未安装（应用更新过，备份属于更新前的版本）",
+  unknown: "未知内容",
+};
 
 function status(options = {}) {
   return withoutAsar(() => statusRaw(options));
 }
 
-function statusRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, log = none } = {}) {
+function statusRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, payloadDir = PAYLOAD_DIR, log = none } = {}) {
   const paths = pathsFor(archive, { backupDir, stateFile });
   const fd = openArchive(paths.archive, "r");
   try {
     const state = readState(paths.stateFile);
     const entries = [];
     log(`asar      ${paths.archive}`);
-    log(`载荷目录  ${PAYLOAD_DIR}`);
+    log(`载荷目录  ${payloadDir}`);
     log(`状态文件  ${paths.stateFile}${state ? "" : "（不存在，可能尚未安装）"}`);
     if (state?.installedAt) log(`安装时间  ${state.installedAt}`);
     log("");
     for (const entryPath of ENTRIES) {
       const snap = snapshot(fd, entryPath);
-      const payloadFile = path.join(PAYLOAD_DIR, path.basename(entryPath));
-      const payload = fs.existsSync(payloadFile) ? payloadFor(entryPath) : null;
+      const payloadFile = path.join(payloadDir, path.basename(entryPath));
+      const payload = fs.existsSync(payloadFile) ? payloadFor(entryPath, payloadDir) : null;
       const backupFile = path.join(paths.backupDir, backupName(entryPath));
       const backupBuf = fs.existsSync(backupFile) ? fs.readFileSync(backupFile) : null;
-      const verdict = verdictFor(snap, payload, backupBuf);
+      const fits = backupFits(backupBuf, snap.size);
+      const verdict = verdictWithBackupAge(snap, payload, fits ? backupBuf : null, backupBuf !== null && !fits);
       const integrity = integrityOk(snap);
       entries.push({
         entryPath,
@@ -204,7 +256,9 @@ function statusRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, log = none
         headerHash: snap.headerHash,
         payloadSize: payload === null ? null : payload.length,
         lengthMismatch: payload !== null && payload.length !== snap.size,
-        hasBackup: backupBuf !== null,
+        hasBackup: fits,
+        hasStaleBackup: backupBuf !== null && !fits,
+        backupSize: backupBuf === null ? null : backupBuf.length,
         verdict,
         integrity
       });
@@ -213,6 +267,7 @@ function statusRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, log = none
       log(`  内容 sha256  ${snap.hash}`);
       log(`  判定      ${VERDICT_TEXT[verdict]}`);
       log(`  头部      ${short(snap.headerHash)}  ${integrity.ok ? "OK" : "不一致"}  ${integrity.detail}`);
+      if (backupBuf !== null && !fits) log(`  备份      ${backupBuf.length} 字节，与本条目 ${snap.size} 字节不符：这是更新前那个版本的备份，不能用于还原；下次 apply 时会归档并重新备份。`);
       log("");
     }
     const installed = entries.filter((entry) => entry.verdict === "installed").length;
@@ -228,7 +283,7 @@ function verify(options = {}) {
   return withoutAsar(() => verifyRaw(options));
 }
 
-function verifyRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, log = none } = {}) {
+function verifyRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, payloadDir = PAYLOAD_DIR, log = none } = {}) {
   const paths = pathsFor(archive, { backupDir, stateFile });
   const fd = openArchive(paths.archive, "r");
   const entries = [];
@@ -240,8 +295,8 @@ function verifyRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, log = none
       const snap = snapshot(fd, entryPath);
       const integrity = integrityOk(snap);
       const syntax = syntaxCheck(snap.buf, path.basename(entryPath));
-      const payloadFile = path.join(PAYLOAD_DIR, path.basename(entryPath));
-      const isPayload = fs.existsSync(payloadFile) && asar.sha256(payloadFor(entryPath)) === snap.hash;
+      const payloadFile = path.join(payloadDir, path.basename(entryPath));
+      const isPayload = fs.existsSync(payloadFile) && asar.sha256(payloadFor(entryPath, payloadDir)) === snap.hash;
       const ok = integrity.ok && syntax.ok && isPayload;
       if (!ok) failures += 1;
       entries.push({ entryPath, size: snap.size, hash: snap.hash, integrity, syntax, isPayload, ok });
@@ -260,9 +315,9 @@ function apply(options = {}) {
   return withoutAsar(() => applyRaw(options));
 }
 
-function applyRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, log = none } = {}) {
+function applyRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, payloadDir = PAYLOAD_DIR, log = none } = {}) {
   const paths = pathsFor(archive, { backupDir, stateFile });
-  const payloads = new Map(ENTRIES.map((entryPath) => [entryPath, payloadFor(entryPath)]));
+  const payloads = new Map(ENTRIES.map((entryPath) => [entryPath, payloadFor(entryPath, payloadDir)]));
   fs.mkdirSync(paths.backupDir, { recursive: true });
   const manifestFile = path.join(paths.backupDir, "manifest.json");
   const manifest = fs.existsSync(manifestFile) ? JSON.parse(fs.readFileSync(manifestFile, "utf8")) : { entries: {} };
@@ -285,7 +340,15 @@ function applyRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, log = none 
         throw new Error(`${entryPath} 现有 ${snap.size} 字节，载荷 ${payload.length} 字节；长度不同会平移后续偏移，已中止（未写入任何字节）`);
       }
       const backupFile = path.join(paths.backupDir, backupName(entryPath));
-      if (!fs.existsSync(backupFile)) {
+      const existing = fs.existsSync(backupFile) ? fs.readFileSync(backupFile) : null;
+      const fits = backupFits(existing, snap.size);
+      if (!fits) {
+        // A previous build's backup, or none at all. Either way the current
+        // bytes are what `revert` has to be able to restore, so they are the
+        // ones saved; the old file is moved aside rather than deleted.
+        if (existing !== null) {
+          archiveStaleBackup(paths.backupDir, entryPath, existing, `与当前 ${snap.size} 字节不符`, log);
+        }
         fs.writeFileSync(backupFile, snap.buf);
         manifest.entries[entryPath] = {
           backupFile: path.relative(ROOT, backupFile),
@@ -297,7 +360,7 @@ function applyRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, log = none 
         fs.writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
         log(`备份      ${entryPath} → ${path.relative(ROOT, backupFile)}（${snap.size} 字节，${short(snap.hash)}）`);
       } else {
-        log(`备份      已存在，保留首份备份 ${path.relative(ROOT, backupFile)}`);
+        log(`备份      已存在，保留现有备份 ${path.relative(ROOT, backupFile)}（${snap.size} 字节，与当前一致）`);
       }
       const written = asar.writeEntry(fd, asar.readHeader(fd), entryPath, payload);
       fs.fsyncSync(fd);
@@ -309,7 +372,7 @@ function applyRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, log = none 
     fs.closeSync(fd);
   }
 
-  const readback = verify({ archive: paths.archive, backupDir: paths.backupDir, stateFile: paths.stateFile, log: (line) => log(line === "" ? "" : `回读 ${line.trim()}`) });
+  const readback = verify({ archive: paths.archive, backupDir: paths.backupDir, stateFile: paths.stateFile, payloadDir, log: (line) => log(line === "" ? "" : `回读 ${line.trim()}`) });
   if (readback.failures > 0) {
     return { archive: paths.archive, backupDir: paths.backupDir, stateFile: paths.stateFile, ok: false, changed, entries: report, readback, error: `回读校验失败 ${readback.failures} 项，可执行 revert 恢复备份` };
   }
@@ -334,9 +397,9 @@ function revert(options = {}) {
   return withoutAsar(() => revertRaw(options));
 }
 
-function revertRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, log = none } = {}) {
+function revertRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, payloadDir = PAYLOAD_DIR, log = none } = {}) {
   const paths = pathsFor(archive, { backupDir, stateFile });
-  const payloads = new Map(ENTRIES.map((entryPath) => [entryPath, payloadFor(entryPath)]));
+  const payloads = new Map(ENTRIES.map((entryPath) => [entryPath, payloadFor(entryPath, payloadDir)]));
   const manifestFile = path.join(paths.backupDir, "manifest.json");
   const manifest = fs.existsSync(manifestFile) ? JSON.parse(fs.readFileSync(manifestFile, "utf8")) : { entries: {} };
   const fd = openArchive(paths.archive, "r+");
@@ -355,7 +418,10 @@ function revertRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, log = none
         continue;
       }
       if (snap.size !== original.length) {
-        throw new Error(`${entryPath} 现有 ${snap.size} 字节，备份 ${original.length} 字节；长度不同会平移后续偏移，已中止`);
+        throw new Error(
+          `${entryPath} 现有 ${snap.size} 字节，备份 ${original.length} 字节：这份备份属于更新前的版本，不能用来还原当前内容。` +
+            `这不是补丁装坏了，而是 DeepSeek Harness 更新过；重新执行 apply 会归档旧备份并记下当前内容的备份。`,
+        );
       }
       const written = asar.writeEntry(fd, asar.readHeader(fd), entryPath, original);
       fs.fsyncSync(fd);

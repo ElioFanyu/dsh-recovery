@@ -2,17 +2,17 @@
   "entries": {
     "lib/main.js": {
       "backupFile": "backup\\lib__main.js.orig",
-      "size": 838520,
-      "sha256": "f42ed25b0b844a63e515a3aff93dee89b781dae7fcbbbbfc93e04d95ad399ec1",
-      "headerHash": "f42ed25b0b844a63e515a3aff93dee89b781dae7fcbbbbfc93e04d95ad399ec1",
-      "backedUpAt": "2026-11-06T03:59:42.598Z"
+      "size": 848505,
+      "sha256": "d8a5f9bd5e1c72e59ec52c036278d7ff5605f40cf70df3dd1721f5c12cbab817",
+      "headerHash": "d8a5f9bd5e1c72e59ec52c036278d7ff5605f40cf70df3dd1721f5c12cbab817",
+      "backedUpAt": "2026-11-13T04:54:52.539Z"
     },
     "lib/preload-app.cjs": {
       "backupFile": "backup\\lib__preload-app.cjs.orig",
-      "size": 128716,
-      "sha256": "d6126b3555fcb679f79922c23976025ab260a08f98bc2d20984e112ded397b96",
-      "headerHash": "d6126b3555fcb679f79922c23976025ab260a08f98bc2d20984e112ded397b96",
-      "backedUpAt": "2026-11-06T03:59:42.632Z"
+      "size": 140570,
+      "sha256": "cca56f6da8272f4b78b708a285816fcfd567e701f1248eab777d3943c50e233e",
+      "headerHash": "cca56f6da8272f4b78b708a285816fcfd567e701f1248eab777d3943c50e233e",
+      "backedUpAt": "2026-11-13T04:54:52.542Z"
     }
   }
 }

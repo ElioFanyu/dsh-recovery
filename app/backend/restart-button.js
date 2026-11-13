@@ -13,8 +13,13 @@ const path = require("node:path");
 const TOOL_DIR = path.resolve(__dirname, "..", "..", "restart-button");
 const patch = require(path.join(TOOL_DIR, "lib", "patch.cjs"));
 
-const VERDICT_LABEL = { installed: "已安装（= 载荷）", original: "未安装（= 备份的原始内容）", unknown: "未知内容" };
-const VERDICT_TONE = { installed: "ok", original: "muted", unknown: "warn" };
+const VERDICT_LABEL = {
+  installed: "已安装（= 载荷）",
+  original: "未安装（= 备份的原始内容）",
+  stale: "未安装（应用更新过）",
+  unknown: "未知内容",
+};
+const VERDICT_TONE = { installed: "ok", original: "muted", stale: "warn", unknown: "warn" };
 
 const short = (hash) => (typeof hash === "string" ? `${hash.slice(0, 16)}…` : undefined);
 
@@ -63,6 +68,8 @@ function summarize(target) {
       hashLabel: short(entry.hash),
       headerHashLabel: short(entry.headerHash),
       hasBackup: entry.hasBackup,
+      hasStaleBackup: entry.hasStaleBackup === true,
+      backupSize: entry.backupSize,
       lengthMismatch: entry.lengthMismatch,
       verdict: entry.verdict,
       verdictLabel: VERDICT_LABEL[entry.verdict] ?? entry.verdict,

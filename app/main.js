@@ -670,6 +670,11 @@ async function runUiCheck({ shot }) {
     if (!panel.text.includes("重启按钮补丁")) issues.push("面板中没有「重启按钮补丁」卡片");
     if (!panel.text.includes("app.asar")) issues.push("面板中没有 app.asar 信息");
     if (!panel.text.includes("已安装")) issues.push("面板没有报告「已安装」（当前 app.asar 已是补丁内容）");
+    // A backup left over from a previous build must never be advertised as
+    // restorable: the length no longer matches, so revert could only abort.
+    if (/旧备份\s*[\d.]+\s*(KB|B|MB)\s*属于更新前的版本/u.test(panel.text) && panel.text.includes("有原始备份")) {
+      issues.push("面板同时声称「旧备份属于更新前的版本」和「有原始备份」");
+    }
     const actions = panel.buttons.map((button) => button.action);
     for (const action of ["restart-button-apply", "restart-button-verify", "restart-button-revert"]) {
       if (!actions.includes(action)) issues.push(`面板缺少按钮 ${action}`);

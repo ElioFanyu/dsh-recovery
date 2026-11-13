@@ -1762,6 +1762,7 @@ async function runVerify({ version, targets }) {
     await verifyCookies(controller, fixture, result);
     await verifyPluginVersionsAndSelfUpdate(controller, fixture, result);
     await verifyAwesome(controller, fixture, result);
+    await verifyRestartButton(fixture, result);
     await verifyCheckpoints(controller, fixture, result);
     await verifyTargets(controller, fixture, result);
     await verifyLaunch(controller, fixture, result, archive);
@@ -1830,6 +1831,182 @@ async function runVerify({ version, targets }) {
     passed: result.passed,
     failed: result.failed,
   };
+}
+
+/**
+ * Builds a miniature `.asar` archive with the same pickle layout the real one
+ * uses, so the restart-button patcher can be exercised without touching the
+ * 208 MB official archive.
+ *
+ * Layout, verified against the installed `resources\app.asar`:
+ *   u32 @0  4                 pickle version
+ *   u32 @4  headerBufSize     json length + padding + 8
+ *   u32 @8  headerBufSize - 4 the same value, minus its own length field
+ *   u32 @12 jsonLength        exact JSON byte count
+ *   @16     JSON              then padding up to `jsonLength + pad`
+ *   @8+headerBufSize          file data, addressed by `offset`
+ */
+function buildTinyAsar(entries) {
+  const json = { files: {} };
+  let cursor = 0;
+  const bodies = [];
+  for (const [entryPath, text] of Object.entries(entries)) {
+    const buf = Buffer.from(text, "utf8");
+    const parts = entryPath.split("/");
+    let node = json;
+    for (const part of parts.slice(0, -1)) {
+      node.files[part] ??= { files: {} };
+      node = node.files[part];
+    }
+    node.files[parts.at(-1)] = {
+      size: buf.length,
+      offset: String(cursor),
+      integrity: { algorithm: "SHA256", hash: createHash("sha256").update(buf).digest("hex"), blockSize: 4194304, blocks: [] },
+    };
+    bodies.push(buf);
+    cursor += buf.length;
+  }
+  const jsonBuf = Buffer.from(JSON.stringify(json), "utf8");
+  const pad = (4 - (jsonBuf.length % 4)) % 4;
+  const head = Buffer.alloc(16);
+  head.writeUInt32LE(4, 0);
+  // `readHeader` computes `dataOffset = 8 + headerBufSize`, and the JSON starts
+  // at 16, so headerBufSize must cover the 8 header bytes it already spans:
+  // json + pad + 8. Writing `+ 4` here shifted every offset by four bytes and
+  // the archive read back as corrupt JSON.
+  head.writeUInt32LE(jsonBuf.length + pad + 8, 4);
+  head.writeUInt32LE(jsonBuf.length + pad + 4, 8);
+  head.writeUInt32LE(jsonBuf.length, 12);
+  return Buffer.concat([head, jsonBuf, Buffer.alloc(pad), ...bodies]);
+}
+
+/**
+ * The restart-button patch installs by rewriting two archive entries with bytes
+ * of exactly their original length, and a DeepSeek Harness update replaces the
+ * whole `app.asar` — which silently reverts it. That second half is what this
+ * covers: the payload must be rebuilt for the installed build, and a backup left
+ * over from the previous build must never be presented as restorable.
+ */
+async function verifyRestartButton(fixture, result) {
+  const patchPath = path.join(__dirname, "..", "..", "restart-button", "lib", "patch.cjs");
+  if (!isFile(patchPath)) {
+    result.fail("重启按钮: 补丁工具存在", patchPath);
+    return;
+  }
+  const patch = require(patchPath);
+  const dir = path.join(fixture.root, "restart-button");
+  const archive = path.join(dir, "app.asar");
+  const backupDir = path.join(dir, "backup");
+  const stateFile = path.join(dir, "state.json");
+  const payloadDir = path.join(dir, "payload");
+  ensureDir(payloadDir);
+
+  // Derived by substitution, so the two payloads are equal length by
+  // construction rather than by two hand-counted strings that drift apart.
+  const ORIGINAL = "// original build\nconst menu = [0];\n";
+  const PATCHED = ORIGINAL.replace("[0]", "[1]");
+  if (Buffer.byteLength(ORIGINAL) !== Buffer.byteLength(PATCHED)) {
+    result.fail("重启按钮: fixture 载荷等长", `${Buffer.byteLength(ORIGINAL)} vs ${Buffer.byteLength(PATCHED)}`);
+    return;
+  }
+  // Same length as the originals, so the patcher accepts them; the content is
+  // irrelevant to the layout logic under test.
+  fs.writeFileSync(path.join(payloadDir, "main.js"), PATCHED);
+  fs.writeFileSync(path.join(payloadDir, "preload-app.cjs"), PATCHED);
+  // Electron's patched `fs` treats any `*.asar` path as a virtual directory and
+  // throws "Invalid package" on a raw read or write, so every direct access to
+  // the archive file below goes through these wrappers.
+  const WRITE_RAW = (file, buf) => withoutAsar(() => fs.writeFileSync(file, buf));
+  const READ_RAW = (file) => withoutAsar(() => fs.readFileSync(file));
+  const SIZE_RAW = (file) => withoutAsar(() => fs.statSync(file).size);
+  const tinyArchive = () => buildTinyAsar({ "lib/main.js": ORIGINAL, "lib/preload-app.cjs": ORIGINAL });
+  WRITE_RAW(archive, tinyArchive());
+  const options = { archive, backupDir, stateFile, payloadDir, log: () => {} };
+
+  const initial = patch.status(options);
+  result.ok(
+    "重启按钮: 原始内容判定为未安装",
+    initial.installed === 0 && initial.entries.every((entry) => entry.verdict === "unknown" || entry.verdict === "original"),
+    JSON.stringify(initial.entries.map((entry) => entry.verdict)),
+  );
+
+  const applied = patch.apply(options);
+  result.ok("重启按钮: 安装补丁", applied.ok === true && applied.changed === 2, applied.error ?? JSON.stringify(applied.entries));
+
+  const sizeBeforeApply = SIZE_RAW(archive);
+  const installed = patch.status(options);
+  result.ok("重启按钮: 安装后判定为已安装", installed.conclusion === "installed", installed.conclusion);
+  result.ok(
+    "重启按钮: 安装后头部 integrity 一致",
+    installed.entries.every((entry) => entry.integrity.ok === true),
+    JSON.stringify(installed.entries.map((entry) => entry.integrity.detail)),
+  );
+  result.ok(
+    "重启按钮: 安装不改变归档长度",
+    SIZE_RAW(archive) === sizeBeforeApply,
+    `${sizeBeforeApply} → ${SIZE_RAW(archive)}`,
+  );
+
+  const reverted = patch.revert(options);
+  result.ok("重启按钮: 还原补丁", reverted.ok === true && reverted.touched === 2, reverted.error);
+  const backToOriginal = patch.status(options);
+  result.ok(
+    "重启按钮: 还原后内容等于安装前",
+    backToOriginal.installed === 0 &&
+      READ_RAW(archive).equals(tinyArchive()),
+    backToOriginal.conclusion,
+  );
+
+  // The regression this exists for: an application update replaces the archive
+  // wholesale, so the entries are official content again and the backup on disk
+  // still belongs to the previous build. Simulated faithfully — the archive is
+  // rewritten with *new* official content (same length, as the patcher requires),
+  // not left holding the patch.
+  const UPDATED = ORIGINAL.replace("original build", "updated build!");
+  WRITE_RAW(archive, buildTinyAsar({ "lib/main.js": UPDATED, "lib/preload-app.cjs": UPDATED }));
+  const staleBackup = Buffer.from("// a much older build, different length\n");
+  fs.writeFileSync(path.join(backupDir, "lib__main.js.orig"), staleBackup);
+  fs.writeFileSync(path.join(backupDir, "lib__preload-app.cjs.orig"), staleBackup);
+  const stale = patch.status(options);
+  result.ok(
+    "重启按钮: 旧备份不被当作可还原",
+    stale.entries.every((entry) => entry.hasStaleBackup === true && entry.hasBackup === false),
+    JSON.stringify(stale.entries.map((entry) => ({ hasBackup: entry.hasBackup, hasStaleBackup: entry.hasStaleBackup }))),
+  );
+  result.ok(
+    "重启按钮: 更新后判定为「更新过，未安装」",
+    stale.conclusion === "absent" && stale.entries.every((entry) => entry.verdict === "stale"),
+    JSON.stringify(stale.entries.map((entry) => entry.verdict)),
+  );
+
+  const reApplied = patch.apply(options);
+  result.ok("重启按钮: 应用更新后仍能重新安装", reApplied.ok === true, reApplied.error);
+  result.ok(
+    "重启按钮: 旧备份被归档而不是删除",
+    fs.readdirSync(backupDir).some((name) => name.startsWith("stale-")),
+    fs.readdirSync(backupDir).join(", "),
+  );
+  result.ok(
+    "重启按钮: 归档后备份长度与当前一致",
+    fs.readFileSync(path.join(backupDir, "lib__main.js.orig")).length === Buffer.byteLength(UPDATED),
+    String(fs.readFileSync(path.join(backupDir, "lib__main.js.orig")).length),
+  );
+
+  const finalRevert = patch.revert(options);
+  result.ok("重启按钮: 归档后可正常还原", finalRevert.ok === true && finalRevert.touched === 2, finalRevert.error);
+  const restored = patch.status(options);
+  result.ok(
+    "重启按钮: 还原到应用更新后的内容",
+    restored.installed === 0 &&
+      READ_RAW(archive).equals(buildTinyAsar({ "lib/main.js": UPDATED, "lib/preload-app.cjs": UPDATED })),
+    restored.conclusion,
+  );
+
+  result.ok(
+    "重启按钮: 状态文件随还原删除",
+    !fs.existsSync(stateFile),
+    stateFile,
+  );
 }
 
 module.exports = { runVerify };

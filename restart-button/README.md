@@ -4,7 +4,7 @@
 > 同一份实现既提供**恢复器界面里的「重启按钮」页签**（一键安装 / 校验 / 还原），
 > 也保留下面这套**命令行入口**（DSH 完全起不来、连恢复器都不想开时用）。
 
-给官方 **DeepSeek Harness** 桌面壳（`@deepseek-ai/dsh-desktop` 0.2.2-rc.1）的标题栏菜单栏
+给官方 **DeepSeek Harness** 桌面壳（`@deepseek-ai/dsh-desktop` 0.2.2-rc.2）的标题栏菜单栏
 加一个 **「重启」** 按钮，位置在「应用」「编辑」右侧。
 
 菜单结构变化（只动这两处）：
@@ -30,12 +30,13 @@
 
 ![「重启按钮」页签](../docs/restart-button-tab.png)
 
-**本机当前状态（2026-11-06 复核，DSH 0.2.2-rc.1）**：官方从 rc.5 升到 0.2.2-rc.1 后 `app.asar` 被整体替换
-（213202918 B），补丁随之消失。已按下面「升级流程」重新解包、重建载荷并重装，`status` 报两个条目
+**本机当前状态（2026-11-13 复核，DSH 0.2.2-rc.2）**：官方从 rc.1 升到 rc.2 后 `app.asar` 被整体替换
+（208137981 B），补丁随之消失。已按下面「升级流程」重新解包、重建载荷并重装，`status` 报两个条目
 「已安装（= 载荷）」，恢复器页签显示「已安装 2/2 · 头部 integrity 一致 · 有原始备份」。
 
-这次上游改动比以往大：`lib/main.js` 516716 → **838520 B**，`lib/preload-app.cjs` 41075 → **128716 B**
-（体积翻倍），所以**旧的载荷与旧备份都不能再用**——见下面「升级流程」第 2 步。
+上游这次改动比 rc.1 那次小：`lib/main.js` 838520 → **848505 B**，`lib/preload-app.cjs` 128716 →
+**140570 B**，编辑表只需补一个候选（见下节）。但**旧载荷与旧备份一律不能再用**——见「升级流程」第 2 步，
+以及后面「应用更新后补丁消失」。
 
 **方式二：命令行**（本目录）：
 
@@ -108,26 +109,48 @@ node lib\build-payload.cjs --write  :: 生成 payload\lib\{main.js,preload-app.c
 
 - 源码基线：`D:\Workspace\DeepSeek Harness\.dsh-src\lib\{main.js,preload-app.cjs}`（**未打补丁**的
   解包副本，`build-payload.cjs` 的默认 `DSH_PATCH_SRC`，可用同名环境变量覆盖）。
-  当前这份基线是 **0.2.2-rc.1**：`main.js` 838520 B（sha256 `f42ed25b…`）、
-  `preload-app.cjs` 128716 B（sha256 `d6126b35…`）。官方再更新时按「升级流程」重新解一遍再指过去。
+  当前这份基线是 **0.2.2-rc.2**：`main.js` 848505 B（sha256 `d8a5f9bd…`）、
+  `preload-app.cjs` 140570 B（sha256 `cca56f6d…`）。官方再更新时按「升级流程」重新解一遍再指过去。
 - 目标长度从 asar 头部实时读取，不写死；长度不符会直接报错中止。
-- 生成的载荷已通过 `node --check`；当前载荷（0.2.2-rc.1）sha256：
-  - `lib/main.js` → `95f95ca20821155d19338120c04f1a5e04bcf15c84ed6e3ba9a40057c9dad4d0`
-  - `lib/preload-app.cjs` → `a0b7da294f4b5a4519dd90168b12e6dc57ded6430edcb940330c171f3041f370`
+- 生成的载荷已通过 `node --check`；当前载荷（0.2.2-rc.2）sha256：
+  - `lib/main.js` → `8b5e11ba0d754f4e57096e323410203b91f6aef74666f9d7d176ee2ca11c66d9`
+  - `lib/preload-app.cjs` → `56e0dd4deb0cada1368307737be2c5254f9cd4e7d646f79952877be3ba2d2c01`
 
-### 上游改动对补丁的影响（0.2.2-rc.1）
+### 上游改动对补丁的影响（0.2.2-rc.2）
 
-升级后 `build-payload.cjs` 的编辑表有两处**必须跟着改**，否则重建会直接报「匹配 0 次」中止：
+升级到 0.2.2-rc.2 后 `build-payload.cjs` 的编辑表**有一处必须跟着改**，否则重建会直接报
+「匹配 0 次」中止：
 
-1. 开发块换了排版。0.2.1 写作 `...development ? [\n  { type: "separator" },`（分隔线单独一行、
-   花括号另起），0.2.2 内联成 `...development ? [{`。编辑表现在**同时接受两种写法**，
-   由 `pickCandidate()` 选「恰好命中一次」的那个；两个都命中会直接报错，不会误删。
-2. `DesktopHostProcess` 构造函数新增了 `onPluginOperation` 参数，多出一行 JSDoc。
-   该条编辑同样改成两个候选（带/不带新参数行）。
+1. `DesktopHostProcess` 构造函数的 `primaryRuntime` 说明改写了（rc.1 是「when supplied, missing
+   sibling `office-skills` resources fail Host startup」，rc.2 换成「the Host exposes it to its
+   profile as `DSH_PRIMARY_RUNTIME`」）。该条编辑现在有三个候选（rc.2 / rc.1 / 更早），
+   `pickCandidate()` 选「恰好命中一次」的那个。
 
-其余锚点（`applicationItems`、`windowsMenu` 白名单、en/zh 文案、`createButton`、方向键）逐字未变。
-本次等长取舍量：`main.js` −776 B 注释、+1530 B 代码，剩 106 B 由填充注释吃下；
+其余锚点（开发块排版、`applicationItems`、`windowsMenu` 白名单、en/zh 文案、`createButton`、
+方向键、两段被精简的注释）逐字未变——所以 0.2.2-rc.1 那次改的两个候选仍然有效，无需再动。
+
+本次等长取舍量：`main.js` −776 B 注释、+1530 B 代码，剩 86 B 由填充注释吃下；
 `preload-app.cjs` −209 B 注释、+200 B 代码，剩 9 B 同样由填充注释补齐（都在 `MAX_PAD = 400` 以内）。
+
+### 应用更新后补丁消失（v1.10.3 修复）
+
+官方更新会**整体替换** `app.asar`，于是两个条目回到官方内容、补丁消失，而磁盘上还留着**上一个
+版本**的备份。这两个事实叠在一起会造成一个很难发现的假象：
+
+- `status` 只检查备份文件**存不存在**，所以页面上仍写「有原始备份」；
+- 但备份是旧版本的字节，长度和当前条目不同，`revert` 的长度校验必然中止。
+
+也就是说，用户以为能回滚，直到真正需要回滚的那一刻才发现不能。现在三处一起改了：
+
+1. **判定**：备份长度 ≠ 当前条目长度时，判定为「未安装（应用更新过，备份属于更新前的版本）」，
+   而不是含糊的「未知内容」——后者会让人以为文件被什么东西写坏了。
+2. **备份**：`apply` 发现旧备份长度不符时，先把它移到 `backup/stale-<字节数>-<时间戳>/`（**保留、
+   不删除**，那是那个版本唯一的原始副本），再用当前字节建新备份。
+3. **还原**：`revert` 遇到长度不符时给出的错误会直说「这不是补丁装坏了，而是应用更新过，
+   重新执行 apply 会归档旧备份」，而不是只报一句长度不同。
+
+`--verify` 相应新增 15 项检查，用一个小型合成 `app.asar` 覆盖「安装 → 还原 → 应用更新 →
+重新安装 → 再还原」全链路，不再依赖 208 MB 的官方包。
 
 ## 改动内容（逐处）
 
