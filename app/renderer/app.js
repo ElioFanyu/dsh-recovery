@@ -210,6 +210,47 @@ function joinSub(...parts) {
   return kept.length === 0 ? undefined : kept.join(" · ");
 }
 
+/**
+ * Is `latest` a genuine upgrade over `installed`?
+ *
+ * The scan records the version it saw at scan time, and the row shows the
+ * version on disk now. When a plugin was upgraded in between — by 「一键升级」,
+ * by pnpm outside the console, or by a DSH update — the cached `latest` is no
+ * longer newer than what is installed, and rendering it produced the nonsense
+ * 「0.4.18 → 0.4.18 · 有新版本」. Comparing them here keeps the badge honest even
+ * if something forgets to invalidate the cache.
+ */
+/**
+ * Installed version of every registry plugin, by package name.
+ *
+ * The registry scan reports the version it saw when it ran; this is what is on
+ * disk now. Anything that decides "is there an upgrade?" has to look at both, so
+ * the map is built from live state instead of being closed over per render.
+ */
+function installedVersionsByName() {
+  return new Map((state.pluginUpdater?.rows ?? []).map((entry) => [entry.name, entry.version]));
+}
+
+function isNewerVersion(latest, installed) {
+  if (typeof latest !== "string" || typeof installed !== "string") return latest !== installed;
+  const split = (value) => {
+    const [core, pre] = value.split("-", 2);
+    return { nums: core.split(".").map((part) => Number.parseInt(part, 10) || 0), pre };
+  };
+  const left = split(latest);
+  const right = split(installed);
+  for (let index = 0; index < Math.max(left.nums.length, right.nums.length); index += 1) {
+    const a = left.nums[index] ?? 0;
+    const b = right.nums[index] ?? 0;
+    if (a !== b) return a > b;
+  }
+  // Same numbers: a release outranks its own prerelease.
+  if (left.pre === right.pre) return false;
+  if (left.pre === undefined) return true;
+  if (right.pre === undefined) return false;
+  return left.pre > right.pre;
+}
+
 // --- actions --------------------------------------------------------------
 
 function absorb(response) {
@@ -526,14 +567,18 @@ const ACTIONS = {
   "plugin-update-all": async () => {
     const running = state.running.isRunning;
     if (running) return;
-    const versions = state.pluginVersions;
-    const outdated = versions?.outdated ?? [];
-    const targets = outdated.length > 0 ? outdated : (state.pluginUpdater?.rows ?? []).filter((entry) => entry.origin !== "local" && entry.version !== undefined);
-    if (targets.length === 0) {
-      toast("没有可升级的联网插件", "ok");
+    // Only what is *still* outdated by the bytes on disk. Falling back to "every
+    // registry plugin" when the list was empty meant a click could reinstall
+    // packages that were already current; and a stale scan entry would reinstall
+    // one that was upgraded after the scan.
+    const outdated = (state.pluginVersions?.outdated ?? []).filter((entry) =>
+      isNewerVersion(entry.latest, installedVersionsByName().get(entry.name) ?? entry.installed),
+    );
+    if (outdated.length === 0) {
+      toast(state.pluginVersions?.checkedAt === undefined ? "还没有检测过更新，请先点「检测更新」" : "没有可升级的联网插件", "ok");
       return;
     }
-    const names = targets.map((entry) => entry.name);
+    const names = outdated.map((entry) => entry.name);
     if (
       !confirm(
         `一键升级 ${names.length} 个联网插件？\n\n` +
@@ -1010,7 +1055,12 @@ function renderPlugins() {
   // scan (the backend never scans inside `gather()` because that would open a
   // socket on every render), so an unscanned profile reports "还没检查".
   const versions = state.pluginVersions;
-  const outdatedRows = versions?.outdated ?? [];
+  // Recount against what is installed now rather than trusting the cached flag,
+  // so the badge and the button cannot advertise an upgrade that already landed.
+  const installedByName = installedVersionsByName();
+  const outdatedRows = (versions?.outdated ?? []).filter((entry) =>
+    isNewerVersion(entry.latest, installedByName.get(entry.name) ?? entry.installed),
+  );
   const outdatedCount = outdatedRows.length;
   // Packages the registry could not answer for. Kept visible on their own because
   // "查不到" must never be read as "已是最新".
@@ -1405,8 +1455,11 @@ function pluginRow(plugin, updaterRow, running, versionInfo) {
   // Rendered inline (「0.5.32 → 0.5.34」) instead of in a separate card: the
   // version jump belongs next to the version it upgrades from, and a separate
   // list meant reading the same package name twice.
-  const outdated = versionInfo?.outdated === true;
   const latest = versionInfo?.latest;
+  const installedNow = plugin.version ?? updaterRow?.version;
+  // Trust the versions over the flag: a stale scan can say `outdated` while the
+  // installed copy has already caught up.
+  const outdated = versionInfo?.outdated === true && isNewerVersion(latest, installedNow);
   return row({
     name: plugin.name,
     mono: true,
@@ -1416,7 +1469,7 @@ function pluginRow(plugin, updaterRow, running, versionInfo) {
       plugin.categoryLabel,
       // `joinSub` drops undefined parts, so the arrow only appears when a newer
       // version actually exists.
-      outdated && latest !== undefined ? `${plugin.version ?? updaterRow?.version} → ${latest}` : plugin.version,
+      outdated ? `${installedNow} → ${latest}` : plugin.version,
       plugin.installedLocal === true ? undefined : "未安装在本地",
       outdated ? "有新版本" : undefined,
       local ? plugin.sourcePath ?? plugin.spec : undefined,

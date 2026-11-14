@@ -12007,7 +12007,7 @@ function platformWireLocale(locale) {
 * @throws Error when the build carries no client version, instead of reporting a guessed one.
 */
 function desktopClientVersion() {
-	return "0.2.2-rc.2";
+	return "0.2.2-rc.3";
 }
 /**
 * Sample the Desktop client identity for one Platform request.

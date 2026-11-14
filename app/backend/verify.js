@@ -1385,6 +1385,34 @@ async function verifyPluginVersionsAndSelfUpdate(controller, fixture, result) {
     JSON.stringify({ ok: failedRow.ok, outdated: failedRow.outdated, failed: impossible.failed.length }),
   );
 
+  // --- a cached scan must not survive a version change ---------------------
+  //
+  // The regression: after 「一键升级」 the panel kept advertising the upgrade it
+  // had just applied, and 「一键升级（N）」 kept counting plugins that were
+  // already current. The scan result is cached (it needs the network), so every
+  // path that re-reads the profile has to drop it.
+  controller.lastPluginVersions = {
+    registry: "https://registry.example.invalid",
+    checked: 1,
+    rows: [{ name: "placeholder", installed: "1.0.0", latest: "1.1.0", ok: true, outdated: true }],
+    outdated: [{ name: "placeholder", installed: "1.0.0", latest: "1.1.0" }],
+    failed: [],
+    hasUpdates: true,
+    checkedAt: new Date().toISOString(),
+  };
+  result.ok(
+    "插件更新检测: refresh 前缓存里有待升级项",
+    (controller.pluginVersionsSummary().outdated ?? []).length === 1,
+    String((controller.pluginVersionsSummary().outdated ?? []).length),
+  );
+  await controller.refresh({ sizes: false });
+  result.ok(
+    "插件更新检测: refresh 让缓存失效（升级后不再显示可升级）",
+    controller.pluginVersionsSummary().checkedAt === undefined &&
+      (controller.pluginVersionsSummary().outdated ?? []).length === 0,
+    JSON.stringify({ checkedAt: controller.pluginVersionsSummary().checkedAt, outdated: controller.pluginVersionsSummary().outdated.length }),
+  );
+
   // --- registry from .npmrc ------------------------------------------------
   const npmrcDir = path.join(fixture.work, "npmrc-profile");
   ensureDir(npmrcDir);
@@ -2006,6 +2034,73 @@ async function verifyRestartButton(fixture, result) {
     "重启按钮: 状态文件随还原删除",
     !fs.existsSync(stateFile),
     stateFile,
+  );
+
+  // --- same-size, different-build backup ---------------------------------
+  //
+  // 0.2.2-rc.2 → rc.3 changed one version string and nothing else, so both
+  // builds' entries are exactly the same byte count. A size-only test called the
+  // rc.2 backup valid and a revert would have written rc.2 over rc.3.
+  const SAME_SIZE_OLD = ORIGINAL.replace("original build", "previous build");
+  const sameSizeDir = path.join(dir, "same-size");
+  const sameSizeArchive = path.join(sameSizeDir, "app.asar");
+  ensureDir(sameSizeDir);
+  const sameSizeOptions = { archive: sameSizeArchive, backupDir: path.join(sameSizeDir, "backup"), stateFile: path.join(sameSizeDir, "state.json"), payloadDir, log: () => {} };
+  withoutAsar(() => {
+    fs.writeFileSync(sameSizeArchive, buildTinyAsar({ "lib/main.js": SAME_SIZE_OLD, "lib/preload-app.cjs": SAME_SIZE_OLD }));
+  });
+  result.ok(
+    "重启按钮: fixture 的两个构建等长",
+    Buffer.byteLength(SAME_SIZE_OLD) === Buffer.byteLength(ORIGINAL),
+    `${Buffer.byteLength(SAME_SIZE_OLD)} vs ${Buffer.byteLength(ORIGINAL)}`,
+  );
+  patch.apply(sameSizeOptions);
+  // Forge the trap: same length, previous build's bytes, and a manifest that
+  // does not know which build it came from (which is how older tools wrote it).
+  sameSizeOptions.log = () => {};
+  const sameSizeBackupDir = sameSizeOptions.backupDir;
+  fs.writeFileSync(path.join(sameSizeBackupDir, "lib__main.js.orig"), withoutAsar(() => fs.readFileSync(sameSizeArchive)));
+  const forgedManifest = JSON.parse(fs.readFileSync(path.join(sameSizeBackupDir, "manifest.json"), "utf8"));
+  forgedManifest.entries["lib/main.js"] = { backupFile: "backup/lib__main.js.orig", size: Buffer.byteLength(SAME_SIZE_OLD), sha256: "0".repeat(64), backedUpAt: new Date().toISOString() };
+  fs.writeFileSync(path.join(sameSizeBackupDir, "manifest.json"), JSON.stringify(forgedManifest, null, 2));
+  const sameSizeStatus = patch.status(sameSizeOptions);
+  result.ok(
+    "重启按钮: 等长但不同构建的备份不算可还原",
+    sameSizeStatus.entries[0].hasStaleBackup === true && sameSizeStatus.entries[0].hasBackup === false,
+    JSON.stringify(sameSizeStatus.entries.map((entry) => ({ hasBackup: entry.hasBackup, hasStaleBackup: entry.hasStaleBackup }))),
+  );
+
+  // --- a backup must never be filled with the payload ---------------------
+  //
+  // `snap` is what the archive holds now; when the entry is already patched,
+  // copying it into the backup produces a "restore" that rewrites the payload
+  // over itself while status reports 已还原.
+  const idempotentDir = path.join(dir, "idempotent");
+  const idempotentArchive = path.join(idempotentDir, "app.asar");
+  ensureDir(idempotentDir);
+  const idempotentOptions = { archive: idempotentArchive, backupDir: path.join(idempotentDir, "backup"), stateFile: path.join(idempotentDir, "state.json"), payloadDir, log: () => {} };
+  withoutAsar(() => {
+    fs.writeFileSync(idempotentArchive, tinyArchive());
+  });
+  patch.apply(idempotentOptions);
+  const backupOfOriginal = withoutAsar(() => fs.readFileSync(path.join(idempotentOptions.backupDir, "lib__main.js.orig")));
+  patch.apply(idempotentOptions);
+  const backupAfterSecond = withoutAsar(() => fs.readFileSync(path.join(idempotentOptions.backupDir, "lib__main.js.orig")));
+  result.ok(
+    "重启按钮: 重复安装不会把载荷写进备份",
+    backupAfterSecond.equals(backupOfOriginal) && !backupAfterSecond.equals(Buffer.from(PATCHED, "utf8")),
+    `${backupAfterSecond.length} 字节,等于载荷=${backupAfterSecond.equals(Buffer.from(PATCHED, "utf8"))}`,
+  );
+
+  // With no usable backup and an already-patched entry, apply must say so
+  // rather than inventing one.
+  fs.rmSync(path.join(idempotentOptions.backupDir, "lib__main.js.orig"), { force: true });
+  const unavailable = patch.apply(idempotentOptions);
+  const unavailableReport = unavailable.entries.find((entry) => entry.entryPath === "lib/main.js");
+  result.ok(
+    "重启按钮: 已打补丁且无备份时不伪造备份",
+    unavailableReport !== undefined && unavailableReport.backup === "unavailable",
+    JSON.stringify(unavailableReport?.backup),
   );
 }
 

@@ -29,7 +29,7 @@ const DEFAULT_BACKUP_DIR = path.join(ROOT, "backup");
 const DEFAULT_STATE_FILE = path.join(ROOT, "state.json");
 const ENTRIES = ["lib/main.js", "lib/preload-app.cjs"];
 const DEFAULT_ARCHIVE = "D:\\Dev Tools\\DeepSeek Harness\\resources\\app.asar";
-const TOOL_VERSION = "1.10.3";
+const TOOL_VERSION = "1.10.4";
 
 const none = () => {};
 const short = (hash) => (hash ? `${hash.slice(0, 16)}…` : "(无)");
@@ -40,26 +40,86 @@ const samePath = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toL
  * Why one backup file must never be reused across an application update.
  *
  * A DeepSeek Harness update replaces `app.asar` wholesale, so the bytes an older
- * tool version saved are the *previous* build's `lib/main.js`, at a different
- * length. Keeping it silently would make `status` claim 「有原始备份」 (the file
- * exists) while `revert` can only abort on the length check — the user believes a
- * rollback is available right up until the moment they need it.
+ * tool version saved belong to the *previous* build. Keeping them silently would
+ * make `status` claim 「有原始备份」 (the file exists) while `revert` restores the
+ * wrong build — the user believes a rollback is available right up until the
+ * moment they need it.
  *
- * The same size is the invariant, not a metadata date: `apply` and `revert` both
- * require it, and two upstream builds practically never agree on it.
+ * **Length is not enough.** 0.2.2-rc.2 → rc.3 changed a single version string
+ * inside `lib/main.js`, so both builds' entries are exactly 848505 bytes. A
+ * length-only test considered the rc.2 backup valid and a revert would have
+ * written rc.2's content back into an rc.3 archive. The archive's own
+ * `dshBuildCommit` is what actually identifies a build, so that is recorded with
+ * the backup and compared first; bytes are compared as well, which catches a
+ * same-build archive that was merely replaced.
  */
-const backupFits = (backupBuf, expectedSize) => backupBuf !== null && backupBuf.length === expectedSize;
+const backupFits = (backup, expected) => {
+  if (backup === null) return false;
+  if (backup.buf.length !== expected.size) return false;
+  // A backup written before `buildId` was recorded has to be identified from its
+  // own bytes. Skip the test when either side is unknown rather than guess.
+  if (backup.buildId !== undefined && expected.buildId !== undefined) return backup.buildId === expected.buildId;
+  if (backup.versionHint !== undefined && expected.version !== undefined) return backup.versionHint === expected.version;
+  return true;
+};
+
+/**
+ * Identifies the application build an archive belongs to.
+ *
+ * `dshBuildCommit` is written by upstream into the archive's root `package.json`
+ * and changes on every release, including releases that touch nothing this patch
+ * cares about. Version alone is too coarse (prerelease rebuilds share it) and
+ * file sizes are demonstrably not unique.
+ */
+function archiveBuildId(fd, header) {
+  const manifest = readRootManifest(fd, header);
+  if (manifest === undefined) return undefined;
+  const commit = typeof manifest.dshBuildCommit === "string" ? manifest.dshBuildCommit : "";
+  const version = typeof manifest.version === "string" ? manifest.version : "";
+  if (commit === "" && version === "") return undefined;
+  return `${version}+${commit.slice(0, 12)}`;
+}
+
+/** The archive's root `package.json`, or undefined when it cannot be read. */
+function readRootManifest(fd, header) {
+  try {
+    const entry = asar.entryAt(header.json, "package.json");
+    const start = header.dataOffset + Number(entry.offset);
+    const buf = Buffer.alloc(entry.size);
+    fs.readSync(fd, buf, 0, entry.size, start);
+    return JSON.parse(buf.toString("utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Version string of a *backup file*'s build, read out of the single line that
+ * differs between releases when nothing else did (`return "0.2.2-rc.3";`).
+ *
+ * Backups written by an earlier tool version carry no build id, and 0.2.2-rc.2 →
+ * rc.3 changed nothing but that string, so length alone cannot tell them apart.
+ * Scanning for the literal is cheap and, unlike a guessed default, it refuses to
+ * call an old backup current.
+ */
+function backupVersionHint(buf) {
+  const head = buf.toString("utf8", 0, Math.min(buf.length, 4 * 1024 * 1024));
+  const match = /return "(\d+\.\d+\.\d+(?:-[\w.]+)?)";/u.exec(head);
+  return match === null ? undefined : match[1];
+}
 
 /**
  * Moves a backup from a previous build out of the way.
  *
  * The bytes are kept, never deleted: they are the only copy of that build's
  * original entry, and a user may still be running that build on another machine.
- * The directory name carries the old size so a human can tell the two apart.
+ * The directory name carries the old build so a human can tell them apart.
  */
-function archiveStaleBackup(backupDir, entryPath, backupBuf, reason, log) {
+function archiveStaleBackup(backupDir, entryPath, backupBuf, reason, log, buildId) {
   const stamp = new Date().toISOString().replace(/[:.]/gu, "-");
-  const dir = path.join(backupDir, `stale-${backupBuf.length}B-${stamp}`);
+  const cleaned = typeof buildId === "string" ? buildId.replace(/[^0-9A-Za-z.]+/gu, "-").replace(/^-+|-+$/gu, "") : "";
+  const label = cleaned === "" ? `${backupBuf.length}B` : cleaned;
+  const dir = path.join(backupDir, `stale-${label}-${stamp}`);
   fs.mkdirSync(dir, { recursive: true });
   const target = path.join(dir, backupName(entryPath));
   fs.writeFileSync(target, backupBuf);
@@ -231,11 +291,17 @@ function status(options = {}) {
 
 function statusRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, payloadDir = PAYLOAD_DIR, log = none } = {}) {
   const paths = pathsFor(archive, { backupDir, stateFile });
+  const manifestFile = path.join(paths.backupDir, "manifest.json");
+  const manifest = fs.existsSync(manifestFile) ? JSON.parse(fs.readFileSync(manifestFile, "utf8")) : { entries: {} };
   const fd = openArchive(paths.archive, "r");
   try {
     const state = readState(paths.stateFile);
+    const header = asar.readHeader(fd);
+    const buildId = archiveBuildId(fd, header);
+    const currentVersion = readRootManifest(fd, header)?.version;
     const entries = [];
     log(`asar      ${paths.archive}`);
+    if (buildId !== undefined) log(`应用构建  ${buildId}`);
     log(`载荷目录  ${payloadDir}`);
     log(`状态文件  ${paths.stateFile}${state ? "" : "（不存在，可能尚未安装）"}`);
     if (state?.installedAt) log(`安装时间  ${state.installedAt}`);
@@ -246,7 +312,14 @@ function statusRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, payloadDir
       const payload = fs.existsSync(payloadFile) ? payloadFor(entryPath, payloadDir) : null;
       const backupFile = path.join(paths.backupDir, backupName(entryPath));
       const backupBuf = fs.existsSync(backupFile) ? fs.readFileSync(backupFile) : null;
-      const fits = backupFits(backupBuf, snap.size);
+      // The manifest records which build each backup came from; a backup saved
+      // before that field existed has `buildId === undefined` and falls back to
+      // the length test alone, which is what the old tool did.
+      const backupBuildId = manifest?.entries?.[entryPath]?.buildId;
+      const backup = backupBuf === null
+        ? null
+        : { buf: backupBuf, buildId: backupBuildId, versionHint: backupBuildId === undefined ? backupVersionHint(backupBuf) : undefined };
+      const fits = backupFits(backup, { size: snap.size, buildId, version: currentVersion });
       const verdict = verdictWithBackupAge(snap, payload, fits ? backupBuf : null, backupBuf !== null && !fits);
       const integrity = integrityOk(snap);
       entries.push({
@@ -259,6 +332,7 @@ function statusRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, payloadDir
         hasBackup: fits,
         hasStaleBackup: backupBuf !== null && !fits,
         backupSize: backupBuf === null ? null : backupBuf.length,
+        backupBuildId,
         verdict,
         integrity
       });
@@ -267,7 +341,13 @@ function statusRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, payloadDir
       log(`  内容 sha256  ${snap.hash}`);
       log(`  判定      ${VERDICT_TEXT[verdict]}`);
       log(`  头部      ${short(snap.headerHash)}  ${integrity.ok ? "OK" : "不一致"}  ${integrity.detail}`);
-      if (backupBuf !== null && !fits) log(`  备份      ${backupBuf.length} 字节，与本条目 ${snap.size} 字节不符：这是更新前那个版本的备份，不能用于还原；下次 apply 时会归档并重新备份。`);
+      if (backupBuf !== null && !fits) {
+        const from = backup?.versionHint ?? backupBuildId ?? "未知构建";
+        const why = backupBuf.length !== snap.size
+          ? `长度 ${backupBuf.length} 字节，与本条目 ${snap.size} 字节不符`
+          : `长度相同但属于另一个构建（备份来自 ${from}，当前是 ${currentVersion ?? buildId ?? "未知构建"}）`;
+        log(`  备份      ${why}：这是更新前那个版本的备份，不能用于还原；下次 apply 时会归档并重新备份。`);
+      }
       log("");
     }
     const installed = entries.filter((entry) => entry.verdict === "installed").length;
@@ -311,6 +391,73 @@ function verifyRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, payloadDir
   }
 }
 
+/**
+ * Keeps the on-disk backup an accurate copy of this build's **original** entry.
+ *
+ * Two rules, both learned from getting them wrong:
+ *
+ * 1. The backup must never be filled with the payload. `snap` is whatever the
+ *    archive currently holds; when the entry is already patched, copying it into
+ *    the backup "succeeds" and leaves a revert that rewrites the payload over
+ *    itself — the menu never comes back, yet status says it was restored.
+ * 2. The backup must describe the build installed now. A leftover from the
+ *    previous release looks fine (a file exists) and only fails when the user
+ *    needs it, so it is replaced at the first opportunity instead of only when
+ *    the entry is being written.
+ *
+ * `canCapture` is false when the entry already holds the payload: the original
+ * bytes are gone from the archive at that point, so a stale backup is only
+ * reported, never overwritten with something worse.
+ */
+function reconcileBackup(entryPath, { snap, payloadHash, buildId, currentVersion, backupDir, manifest, manifestFile, log }) {
+  const backupFile = path.join(backupDir, backupName(entryPath));
+  const existing = fs.existsSync(backupFile) ? fs.readFileSync(backupFile) : null;
+  const existingBuildId = manifest.entries?.[entryPath]?.buildId;
+  const existingVersionHint = existing === null || existingBuildId !== undefined ? undefined : backupVersionHint(existing);
+  const canCapture = snap.hash !== payloadHash;
+  const fits = backupFits(
+    existing === null ? null : { buf: existing, buildId: existingBuildId, versionHint: existingVersionHint },
+    { size: snap.size, buildId, version: currentVersion },
+  );
+  if (fits) {
+    // "fits" means it describes the installed build, not that it equals `snap`:
+    // the backup is the original and `snap` may already be the payload.
+    log(`备份      已存在，保留现有备份 ${path.relative(ROOT, backupFile)}（${snap.size} 字节，属于当前构建）`);
+    return "kept";
+  }
+
+  if (!canCapture) {
+    // Patched, and no usable backup: the original bytes are not in the archive
+    // any more, so there is nothing honest to save. Say so instead of pretending.
+    log(`备份      缺失或来自旧构建，但这一个条目已打补丁，归档里没有原始内容可备份；`);
+    log(`          还原前需要先用官方安装包修复，或先 revert 另一个尚未打补丁的条目。`);
+    return "unavailable";
+  }
+
+  // Move a previous build's backup aside rather than deleting it: it is the only
+  // copy of that build's original entry.
+  if (existing !== null) {
+    const from = existingVersionHint ?? existingBuildId ?? "未知构建";
+    const why = existing.length !== snap.size
+      ? `长度 ${existing.length} 字节，与当前 ${snap.size} 字节不符`
+      : `长度相同但属于另一个构建（备份来自 ${from}，当前是 ${currentVersion ?? buildId ?? "未知构建"}）`;
+    archiveStaleBackup(backupDir, entryPath, existing, why, log, from);
+  }
+  fs.writeFileSync(backupFile, snap.buf);
+  manifest.entries[entryPath] = {
+    backupFile: path.relative(ROOT, backupFile),
+    size: snap.size,
+    sha256: snap.hash,
+    headerHash: snap.headerHash,
+    buildId,
+    version: currentVersion,
+    backedUpAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+  log(`备份      ${entryPath} → ${path.relative(ROOT, backupFile)}（${snap.size} 字节，${short(snap.hash)}${currentVersion === undefined ? "" : `，${currentVersion}`}）`);
+  return "rebuilt";
+}
+
 function apply(options = {}) {
   return withoutAsar(() => applyRaw(options));
 }
@@ -327,40 +474,28 @@ function applyRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, payloadDir 
   const report = [];
   let changed = 0;
   try {
+    const header = asar.readHeader(fd);
+    const buildId = archiveBuildId(fd, header);
+    const currentVersion = readRootManifest(fd, header)?.version;
+    if (buildId !== undefined) log(`应用构建  ${buildId}`);
     for (const entryPath of ENTRIES) {
       const snap = snapshot(fd, entryPath);
       const payload = payloads.get(entryPath);
       const wanted = asar.sha256(payload);
+
+      // The backup is repaired before the entry is considered, and repaired even
+      // when the entry already holds the payload. Otherwise `apply` on an
+      // already-patched archive reports success while leaving a backup from the
+      // previous build behind, which is exactly the state `revert` has to refuse.
+      const backup = reconcileBackup(entryPath, { snap, payloadHash: wanted, buildId, currentVersion, backupDir: paths.backupDir, manifest, manifestFile, log });
+
       if (snap.hash === wanted) {
-        report.push({ entryPath, action: "skip", hash: snap.hash, size: snap.size, note: "已经是载荷内容" });
+        report.push({ entryPath, action: "skip", hash: snap.hash, size: snap.size, note: "已经是载荷内容", backup });
         log(`跳过      ${entryPath} 已经是载荷内容`);
         continue;
       }
       if (snap.size !== payload.length) {
         throw new Error(`${entryPath} 现有 ${snap.size} 字节，载荷 ${payload.length} 字节；长度不同会平移后续偏移，已中止（未写入任何字节）`);
-      }
-      const backupFile = path.join(paths.backupDir, backupName(entryPath));
-      const existing = fs.existsSync(backupFile) ? fs.readFileSync(backupFile) : null;
-      const fits = backupFits(existing, snap.size);
-      if (!fits) {
-        // A previous build's backup, or none at all. Either way the current
-        // bytes are what `revert` has to be able to restore, so they are the
-        // ones saved; the old file is moved aside rather than deleted.
-        if (existing !== null) {
-          archiveStaleBackup(paths.backupDir, entryPath, existing, `与当前 ${snap.size} 字节不符`, log);
-        }
-        fs.writeFileSync(backupFile, snap.buf);
-        manifest.entries[entryPath] = {
-          backupFile: path.relative(ROOT, backupFile),
-          size: snap.size,
-          sha256: snap.hash,
-          headerHash: snap.headerHash,
-          backedUpAt: new Date().toISOString()
-        };
-        fs.writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
-        log(`备份      ${entryPath} → ${path.relative(ROOT, backupFile)}（${snap.size} 字节，${short(snap.hash)}）`);
-      } else {
-        log(`备份      已存在，保留现有备份 ${path.relative(ROOT, backupFile)}（${snap.size} 字节，与当前一致）`);
       }
       const written = asar.writeEntry(fd, asar.readHeader(fd), entryPath, payload);
       fs.fsyncSync(fd);
@@ -403,6 +538,7 @@ function revertRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, payloadDir
   const manifestFile = path.join(paths.backupDir, "manifest.json");
   const manifest = fs.existsSync(manifestFile) ? JSON.parse(fs.readFileSync(manifestFile, "utf8")) : { entries: {} };
   const fd = openArchive(paths.archive, "r+");
+  const buildId = archiveBuildId(fd, asar.readHeader(fd));
   let touched = 0;
   try {
     for (const entryPath of ENTRIES) {
@@ -416,6 +552,16 @@ function revertRaw({ archive = DEFAULT_ARCHIVE, backupDir, stateFile, payloadDir
       if (snap.hash === asar.sha256(original)) {
         log(`跳过      ${entryPath} 已是备份内容`);
         continue;
+      }
+      // Restoring the wrong build's bytes would leave a mixture: one entry from
+      // the old release, one from the new. Length is checked after this because
+      // a same-size cross-build backup is the case that used to slip through.
+      const backupBuildId = manifest.entries?.[entryPath]?.buildId;
+      if (backupBuildId !== undefined && buildId !== undefined && backupBuildId !== buildId) {
+        throw new Error(
+          `${entryPath} 的备份来自 ${backupBuildId}，当前应用是 ${buildId}：这份备份属于更新前的版本，不能还原。` +
+            `这不是补丁装坏了，而是 DeepSeek Harness 更新过；重新执行 apply 会归档旧备份并记下当前内容的备份。`,
+        );
       }
       if (snap.size !== original.length) {
         throw new Error(

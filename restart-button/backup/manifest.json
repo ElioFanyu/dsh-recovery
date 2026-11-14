@@ -1,18 +1,22 @@
 {
   "entries": {
     "lib/main.js": {
-      "backupFile": "backup\\lib__main.js.orig",
+      "backupFile": "restart-button/backup/lib__main.js.orig",
       "size": 848505,
-      "sha256": "d8a5f9bd5e1c72e59ec52c036278d7ff5605f40cf70df3dd1721f5c12cbab817",
-      "headerHash": "d8a5f9bd5e1c72e59ec52c036278d7ff5605f40cf70df3dd1721f5c12cbab817",
-      "backedUpAt": "2026-11-13T04:54:52.539Z"
+      "sha256": "f808749c7a1a907e1acb354e774d1cebf1d1c2561fd789d8fbee1e9c412caa00",
+      "headerHash": "f808749c7a1a907e1acb354e774d1cebf1d1c2561fd789d8fbee1e9c412caa00",
+      "buildId": "0.2.2-rc.3+6b729fedde0c",
+      "version": "0.2.2-rc.3",
+      "backedUpAt": "2026-11-14T02:01:17.868Z"
     },
     "lib/preload-app.cjs": {
-      "backupFile": "backup\\lib__preload-app.cjs.orig",
+      "backupFile": "restart-button/backup/lib__preload-app.cjs.orig",
       "size": 140570,
       "sha256": "cca56f6da8272f4b78b708a285816fcfd567e701f1248eab777d3943c50e233e",
       "headerHash": "cca56f6da8272f4b78b708a285816fcfd567e701f1248eab777d3943c50e233e",
-      "backedUpAt": "2026-11-13T04:54:52.542Z"
+      "buildId": "0.2.2-rc.3+6b729fedde0c",
+      "version": "0.2.2-rc.3",
+      "backedUpAt": "2026-11-14T02:01:17.872Z"
     }
   }
 }

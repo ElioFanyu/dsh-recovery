@@ -518,9 +518,25 @@ async function runUiCheck({ shot }) {
       await win.webContents.executeJavaScript(
         `document.querySelector('.panel[data-panel="plugins"] button[data-action="plugin-version-check"]').click()`,
       );
-      // The scan hits the npm registry, so allow real network time; the point is
-      // to reach the re-render, not to measure latency.
-      await sleep(6000);
+      // The scan hits the npm registry, so wait for it to finish rather than
+      // guessing a duration: 6 s was enough on a warm cache and not enough on a
+      // cold one, which made this assertion flaky in exactly the direction that
+      // looks like a code bug.
+      const scanDeadline = Date.now() + 45_000;
+      for (;;) {
+        const busyNow = await win.webContents.executeJavaScript(
+          `document.querySelector('.panel[data-panel="plugins"] button[data-action="plugin-version-check"]')?.textContent ?? ''`,
+        );
+        const stillChecking = /正在检查/u.test(busyNow);
+        if (!stillChecking) break;
+        if (Date.now() > scanDeadline) {
+          issues.push("「检测更新」45 秒内没有结束（按钮一直显示「正在检查…」）");
+          break;
+        }
+        await sleep(400);
+      }
+      // One extra tick so the re-render triggered by the response lands.
+      await sleep(300);
       const afterScan = await win.webContents.executeJavaScript(
         `(() => {
            const panel = document.querySelector('.panel[data-panel="plugins"]');

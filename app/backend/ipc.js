@@ -236,6 +236,11 @@ class RecoveryController {
 
   async refresh({ sizes = false } = {}) {
     const state = await this.gather({ sizes });
+    // Anything that re-reads the profile may have changed installed versions, so
+    // the cached registry scan no longer describes what is on disk. Keeping it
+    // made the panel advertise an upgrade that had just been applied — and left
+    // 「一键升级」 counting plugins that were already current.
+    this.lastPluginVersions = undefined;
     if (typeof this.onState === "function") this.onState(state);
     return state;
   }
@@ -546,17 +551,47 @@ class RecoveryController {
    * of undefined.
    */
   pluginVersionsSummary() {
-    return (
-      this.lastPluginVersions ?? {
-        registry: undefined,
-        checked: 0,
-        rows: [],
-        outdated: [],
-        failed: [],
-        hasUpdates: false,
-        checkedAt: undefined,
-      }
-    );
+    const cached = this.lastPluginVersions;
+    if (cached === undefined) {
+      return { registry: undefined, checked: 0, rows: [], outdated: [], failed: [], hasUpdates: false, checkedAt: undefined };
+    }
+    // The scan reports the versions it saw when it ran; the profile may have moved
+    // on since. Re-deriving `outdated` here means the panel can never advertise an
+    // upgrade that has already been applied, even if some path forgot to drop the
+    // cache — which is exactly what happened after 「一键升级」.
+    const installed = new Map((this.state?.pluginUpdater?.rows ?? []).map((row) => [row.name, row.version]));
+    const stillOutdated = (cached.outdated ?? []).filter((row) => {
+      const now = installed.get(row.name) ?? row.installed;
+      if (now === undefined || row.latest === undefined) return true;
+      return registry.compareVersions(row.latest, now) === 1;
+    });
+    const byName = new Map(stillOutdated.map((row) => [row.name, row]));
+    return {
+      ...cached,
+      outdated: stillOutdated,
+      rows: (cached.rows ?? []).map((row) => (byName.has(row.name) ? row : { ...row, outdated: false })),
+      hasUpdates: stillOutdated.length > 0,
+    };
+  }
+
+  /**
+   * Ask the registry about every installed, non-local plugin.
+   *
+   * Shared by the explicit 「检测更新」 action and by the post-upgrade rescan so
+   * both report from an identical basis. Never throws for "nothing to check":
+   * an empty list is a valid answer.
+   */
+  async rescanPluginVersions() {
+    const dir = this.requireUpdaterDir();
+    const names = (this.state?.pluginUpdater?.rows ?? [])
+      .filter((row) => row.origin !== "local" && row.version !== undefined && row.declared !== undefined)
+      .map((row) => ({ name: row.name, version: row.version }));
+    if (names.length === 0) {
+      this.lastPluginVersions = { registry: undefined, checked: 0, rows: [], outdated: [], failed: [], hasUpdates: false, checkedAt: new Date().toISOString() };
+      return this.lastPluginVersions;
+    }
+    this.lastPluginVersions = await registry.checkVersions(names, { registry: registry.registryFor(dir) });
+    return this.lastPluginVersions;
   }
 
   /** Packages a one-click upgrade would touch: registry plugins that are installed. */
@@ -975,22 +1010,21 @@ class RecoveryController {
       // answer across re-renders.
       case "recovery:plugin-version-check": {
         try {
-          const dir = this.requireUpdaterDir();
-          const names = (this.state?.pluginUpdater?.rows ?? [])
-            .filter((row) => row.origin !== "local" && row.version !== undefined && row.declared !== undefined)
-            .map((row) => ({ name: row.name, version: row.version }));
-          if (names.length === 0) {
-            this.lastPluginVersions = { registry: undefined, checked: 0, rows: [], outdated: [], failed: [], hasUpdates: false, checkedAt: new Date().toISOString() };
-            return { ok: true, result: { message: "没有可从 npm 检查的联网插件", versions: this.lastPluginVersions }, state: this.state };
+          const versions = await this.rescanPluginVersions();
+          if (versions.checked === 0) {
+            return { ok: true, result: { message: "没有可从 npm 检查的联网插件", versions }, state: this.state };
           }
-          const versions = await registry.checkVersions(names, { registry: registry.registryFor(dir) });
-          this.lastPluginVersions = versions;
           const message =
             versions.outdated.length === 0
               ? `已检查 ${versions.checked} 个联网插件，都是最新版本`
               : `已检查 ${versions.checked} 个联网插件，${versions.outdated.length} 个有更新`;
           this.record(true, message, { outdated: versions.outdated.map((row) => row.name) });
-          return { ok: true, result: { message, versions }, state: await this.refresh({ sizes: false }) };
+          // `refresh()` drops the cached scan, so the fresh result has to be
+          // stored after it — otherwise 「检测更新」 reported a count and then
+          // rendered 「还没检查」.
+          const state = await this.refresh({ sizes: false });
+          this.lastPluginVersions = versions;
+          return { ok: true, result: { message, versions: this.pluginVersionsSummary() }, state: { ...state, pluginVersions: this.pluginVersionsSummary() } };
         } catch (error) {
           return { ok: false, error: `检查更新失败：${describeError(error)}`, state: this.state };
         }
@@ -1008,8 +1042,19 @@ class RecoveryController {
         if (names.length === 0) {
           return { ok: true, result: { message: "没有可升级的联网插件", skipped: true }, state: this.state };
         }
-        return this.runUpdater("一键升级全部插件", "一键升级全部插件", (dir, installDir) =>
+        const outcome = await this.runUpdater("一键升级全部插件", "一键升级全部插件", (dir, installDir) =>
           updater.updateMany(dir, names, { installDir }), { needsPnpm: true });
+        // The upgrade changed versions, so the previous scan is void; asking the
+        // registry again is what lets the panel say 「都是最新版本」 instead of
+        // leaving the user to wonder whether the click did anything. Failure
+        // here must not fail the upgrade itself.
+        let rescan;
+        try {
+          rescan = await this.rescanPluginVersions();
+        } catch (error) {
+          rescan = { error: describeError(error) };
+        }
+        return { ...outcome, result: { ...outcome.result, versions: this.lastPluginVersions, rescan } };
       }
 
       case "recovery:awesome-set-dir": {

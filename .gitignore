@@ -24,3 +24,6 @@ restart-button/backup/*/
 .idea/
 Thumbs.db
 desktop.ini
+
+# 由本机桌面快捷方式生成：记录安装 guard 之前的原始目标，含绝对路径，不进版本库
+restart-button/shortcut-original.json
